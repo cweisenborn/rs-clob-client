@@ -1,0 +1,266 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3648e45..bc2828d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1471,7 +1471,7 @@ version = "3.9.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
+ dependencies = [
+- "darling 0.21.3",
++ "darling 0.23.0",
+  "ident_case",
+  "prettyplease",
+  "proc-macro2",
+@@ -3603,6 +3603,7 @@ dependencies = [
+  "sha2",
+  "strum_macros 0.28.0",
+  "tokio",
++ "tokio-socks",
+  "tokio-tungstenite",
+  "tokio-util",
+  "tracing",
+@@ -5159,6 +5160,18 @@ dependencies = [
+  "tokio",
+ ]
+ 
++[[package]]
++name = "tokio-socks"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0d4770b8024672c1101b3f6733eab95b18007dbe0847a8afe341fcf79e06043f"
++dependencies = [
++ "either",
++ "futures-util",
++ "thiserror 1.0.69",
++ "tokio",
++]
++
+ [[package]]
+ name = "tokio-stream"
+ version = "0.1.17"
+diff --git a/Cargo.toml b/Cargo.toml
+index e54e8a1..a679203 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -34,6 +34,7 @@ tracing = ["dep:tracing", "dep:serde_ignored", "dep:serde_path_to_error"]
+ ws = ["dep:backoff", "dep:bitflags", "dep:tokio", "dep:tokio-tungstenite"]
+ rtds = ["dep:backoff", "dep:tokio", "dep:tokio-tungstenite"]
+ heartbeats = ["dep:tokio", "dep:tokio-util"]
++proxy = ["reqwest/socks", "dep:tokio-socks"]
+ 
+ [dependencies]
+ alloy = { version = "1.6.3", default-features = false, features = [
+@@ -71,6 +72,7 @@ serde_with = { version = "3.18.0", features = ["chrono_0_4", "json"] }
+ sha2 = "0.10.9"
+ strum_macros = "0.28.0"
+ tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"], optional = true }
++tokio-socks = { version = "0.5", optional = true }
+ tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"], optional = true }
+ tokio-util = { version = "0.7.18", optional = true }
+ tracing = { version = "0.1", optional = true }
+diff --git a/src/bridge/client.rs b/src/bridge/client.rs
+index e54e1d9..596e345 100644
+--- a/src/bridge/client.rs
++++ b/src/bridge/client.rs
+@@ -69,6 +69,20 @@ impl Client {
+         })
+     }
+ 
++    /// Creates a new Bridge API client with a custom host and a pre-configured HTTP client.
++    ///
++    /// This enables proxy support, custom timeouts, or other `reqwest::ClientBuilder` options.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the host URL is invalid.
++    pub fn new_with_http_client(host: &str, http_client: ReqwestClient) -> Result<Client> {
++        Ok(Self {
++            host: Url::parse(host)?,
++            client: http_client,
++        })
++    }
++
+     /// Returns the host URL for the client.
+     #[must_use]
+     pub fn host(&self) -> &Url {
+diff --git a/src/clob/client.rs b/src/clob/client.rs
+index d989aff..99f9a9a 100644
+--- a/src/clob/client.rs
++++ b/src/clob/client.rs
+@@ -372,6 +372,15 @@ pub struct Config {
+     #[builder(default = Duration::from_secs(5))]
+     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
+     heartbeat_interval: Duration,
++    /// Optional pre-configured [`reqwest::Client`] to use for HTTP requests.
++    ///
++    /// When provided, this client is used as-is (the SDK's default headers are still applied
++    /// via per-request overrides). This enables proxy support, custom timeouts, or other
++    /// `reqwest::ClientBuilder` options that the SDK doesn't expose directly.
++    ///
++    /// When `None` (the default), the SDK creates its own `reqwest::Client`.
++    #[builder(into)]
++    http_client: Option<ReqwestClient>,
+ }
+ 
+ /// The default geoblock API host (separate from CLOB host)
+@@ -1183,7 +1192,11 @@ impl Client<Unauthenticated> {
+         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+ 
+-        let client = ReqwestClient::builder().default_headers(headers).build()?;
++        let client = if let Some(custom) = config.http_client.clone() {
++            custom
++        } else {
++            ReqwestClient::builder().default_headers(headers).build()?
++        };
+ 
+         let geoblock_host = Url::parse(
+             config
+diff --git a/src/data/client.rs b/src/data/client.rs
+index 9a0d068..d2c73c7 100644
+--- a/src/data/client.rs
++++ b/src/data/client.rs
+@@ -101,6 +101,20 @@ impl Client {
+         })
+     }
+ 
++    /// Creates a new Data API client with a custom host URL and a pre-configured HTTP client.
++    ///
++    /// This enables proxy support, custom timeouts, or other `reqwest::ClientBuilder` options.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the URL is invalid.
++    pub fn new_with_http_client(host: &str, http_client: ReqwestClient) -> Result<Client> {
++        Ok(Self {
++            host: Url::parse(host)?,
++            client: http_client,
++        })
++    }
++
+     /// Returns the base URL of the API.
+     #[must_use]
+     pub fn host(&self) -> &Url {
+diff --git a/src/gamma/client.rs b/src/gamma/client.rs
+index 7c3cccf..a7b9d65 100644
+--- a/src/gamma/client.rs
++++ b/src/gamma/client.rs
+@@ -113,6 +113,20 @@ impl Client {
+         })
+     }
+ 
++    /// Creates a new Gamma API client with a custom host URL and a pre-configured HTTP client.
++    ///
++    /// This enables proxy support, custom timeouts, or other `reqwest::ClientBuilder` options.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the URL is invalid.
++    pub fn new_with_http_client(host: &str, http_client: ReqwestClient) -> Result<Client> {
++        Ok(Self {
++            host: Url::parse(host)?,
++            client: http_client,
++        })
++    }
++
+     /// Returns the base URL of the API.
+     #[must_use]
+     pub fn host(&self) -> &Url {
+diff --git a/src/ws/config.rs b/src/ws/config.rs
+index a6f7a7e..0074536 100644
+--- a/src/ws/config.rs
++++ b/src/ws/config.rs
+@@ -23,6 +23,13 @@ pub struct Config {
+     pub heartbeat_timeout: Duration,
+     /// Reconnection strategy configuration
+     pub reconnect: ReconnectConfig,
++    /// Optional SOCKS5 proxy address (`host:port`) for WebSocket connections.
++    ///
++    /// When set, WebSocket connections are tunneled through the specified SOCKS5 proxy.
++    /// This is useful for geo-restricted access or VPN routing.
++    ///
++    /// Requires the `proxy` feature to be enabled.
++    pub socks5_proxy: Option<String>,
+ }
+ 
+ impl Default for Config {
+@@ -31,6 +38,7 @@ impl Default for Config {
+             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL_DURATION,
+             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
+             reconnect: ReconnectConfig::default(),
++            socks5_proxy: None,
+         }
+     }
+ }
+diff --git a/src/ws/connection.rs b/src/ws/connection.rs
+index 56b8c69..7a90cad 100644
+--- a/src/ws/connection.rs
++++ b/src/ws/connection.rs
+@@ -172,7 +172,7 @@ where
+             _ = state_tx.send(ConnectionState::Connecting);
+ 
+             // Attempt connection
+-            match connect_async(&endpoint).await {
++            match Self::connect(&endpoint, &config).await {
+                 Ok((ws_stream, _)) => {
+                     attempt = 0;
+                     backoff.reset();
+@@ -423,4 +423,58 @@ where
+     pub fn state_receiver(&self) -> watch::Receiver<ConnectionState> {
+         self.state_tx.subscribe()
+     }
++
++    /// Establish a WebSocket connection, optionally through a SOCKS5 proxy.
++    ///
++    /// When the `proxy` feature is enabled and `config.socks5_proxy` is `Some`,
++    /// the connection is tunneled through the specified SOCKS5 proxy. Otherwise,
++    /// a direct connection is established.
++    async fn connect(
++        endpoint: &str,
++        config: &Config,
++    ) -> std::result::Result<
++        (WsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>),
++        tokio_tungstenite::tungstenite::Error,
++    > {
++        #[cfg(feature = "proxy")]
++        if let Some(proxy_addr) = &config.socks5_proxy {
++            return Self::connect_via_proxy(proxy_addr, endpoint).await;
++        }
++
++        let _ = config; // suppress unused warning when proxy feature is off
++        connect_async(endpoint).await
++    }
++
++    /// Connect to a WebSocket endpoint through a SOCKS5 proxy.
++    #[cfg(feature = "proxy")]
++    async fn connect_via_proxy(
++        proxy_addr: &str,
++        endpoint: &str,
++    ) -> std::result::Result<
++        (WsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>),
++        tokio_tungstenite::tungstenite::Error,
++    > {
++        use tokio_tungstenite::tungstenite::Error as WsErr;
++
++        // Parse the WSS URL to extract host and port
++        let url: url::Url = endpoint
++            .parse()
++            .map_err(|_e| WsErr::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName))?;
++        let host = url
++            .host_str()
++            .ok_or(WsErr::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName))?;
++        let port = url.port_or_known_default().unwrap_or(443);
++
++        // Establish SOCKS5 tunnel
++        let socks_stream = tokio_socks::tcp::Socks5Stream::connect(proxy_addr, (host, port))
++            .await
++            .map_err(|e| WsErr::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)))?;
++        let tcp: TcpStream = socks_stream.into_inner();
++
++        // Establish WebSocket over the SOCKS tunnel.
++        // Passing `None` for the connector lets tokio-tungstenite use its default TLS
++        // stack (rustls via the `rustls-tls-native-roots` feature), which handles
++        // certificate validation and TLS negotiation automatically.
++        tokio_tungstenite::client_async_tls_with_config(endpoint, tcp, None, None).await
++    }
+ }
