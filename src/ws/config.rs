@@ -30,6 +30,9 @@ pub struct Config {
     ///
     /// Requires the `proxy` feature to be enabled.
     pub socks5_proxy: Option<String>,
+    /// Capacity of the internal broadcast channel for WS events.
+    /// Larger values provide more headroom for slow consumers at the cost of memory.
+    pub broadcast_capacity: usize,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
             reconnect: ReconnectConfig::default(),
             socks5_proxy: None,
+            broadcast_capacity: 1024,
         }
     }
 }
