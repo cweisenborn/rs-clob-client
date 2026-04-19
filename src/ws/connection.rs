@@ -289,10 +289,23 @@ where
                     }
                 }
 
-                // Handle outgoing messages from subscriptions
-                Some(text) = sender_rx.recv() => {
-                    if write.send(Message::Text(text.into())).await.is_err() {
-                        break;
+                // Handle outgoing messages from subscriptions.
+                //
+                // We match on the full `Option` (rather than the common
+                // `Some(text) = sender_rx.recv()` sugar) so that `None` —
+                // which means every `sender_tx` clone has been dropped —
+                // actively breaks the loop. With the pattern-sugar form,
+                // tokio::select! would just disable this arm and keep
+                // polling `read.next()`, leaving the connection (and its
+                // TCP socket) alive on a silent WS.
+                result = sender_rx.recv() => {
+                    match result {
+                        Some(text) => {
+                            if write.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
 
