@@ -3585,6 +3585,7 @@ dependencies = [
  "dashmap",
  "futures",
  "futures-util",
+ "hex",
  "hmac",
  "httpmock",
  "phf",

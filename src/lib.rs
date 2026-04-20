@@ -43,6 +43,10 @@ use serde::de::DeserializeOwned;
 use crate::error::Error;
 use crate::types::{Address, address};
 
+// Re-export at crate root for convenience
+#[cfg(feature = "clob")]
+pub use crate::clob::types::OrderVersion;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// [`ChainId`] for Polygon mainnet
@@ -59,27 +63,18 @@ pub(crate) type Timestamp = i64;
 static CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
     137_u64 => ContractConfig {
         exchange: address!("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
+        exchange_v2: Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+        neg_risk_exchange: Some(address!("0xC5d563A36AE78145C45a50134d48A1215220f80a")),
+        neg_risk_exchange_v2: Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
         collateral: address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
-        conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
-        neg_risk_adapter: None,
-    },
-    80002_u64 => ContractConfig {
-        exchange: address!("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40"),
-        collateral: address!("0x9c4e1703476e875070ee25b56a58b008cfb8fa78"),
-        conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
-        neg_risk_adapter: None,
-    },
-};
-
-static NEG_RISK_CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
-    137_u64 => ContractConfig {
-        exchange: address!("0xC5d563A36AE78145C45a50134d48A1215220f80a"),
-        collateral: address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
         conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
     },
     80002_u64 => ContractConfig {
-        exchange: address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"),
+        exchange: address!("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40"),
+        exchange_v2: Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+        neg_risk_exchange: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
+        neg_risk_exchange_v2: Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
         collateral: address!("0x9c4e1703476e875070ee25b56a58b008cfb8fa78"),
         conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
@@ -109,14 +104,21 @@ const SAFE_INIT_CODE_HASH: B256 =
     b256!("0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf");
 
 /// Helper struct to group the relevant deployed contract addresses
-#[non_exhaustive]
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct ContractConfig {
+    /// V1 standard exchange.
     pub exchange: Address,
+    /// V2 standard exchange. `None` on chains where V2 hasn't deployed.
+    pub exchange_v2: Option<Address>,
+    /// V1 neg-risk exchange (today's `NEG_RISK_CONFIG[chain].exchange`).
+    pub neg_risk_exchange: Option<Address>,
+    /// V2 neg-risk exchange.
+    pub neg_risk_exchange_v2: Option<Address>,
     pub collateral: Address,
     pub conditional_tokens: Address,
-    /// The Neg Risk Adapter contract address. Only present for neg-risk market configs.
-    /// Users must approve this contract for token transfers to trade in neg-risk markets.
+    /// Neg-risk adapter contract. Used for merge/split/redeem on neg-risk markets
+    /// and must be granted ERC-20/ERC-1155 approvals by any wallet trading those
+    /// markets. Shared across V1 and V2.
     pub neg_risk_adapter: Option<Address>,
 }
 
@@ -133,11 +135,18 @@ pub struct WalletContractConfig {
 
 /// Given a `chain_id` and `is_neg_risk`, return the relevant [`ContractConfig`]
 #[must_use]
-pub fn contract_config(chain_id: ChainId, is_neg_risk: bool) -> Option<&'static ContractConfig> {
-    if is_neg_risk {
-        NEG_RISK_CONFIG.get(&chain_id)
+pub fn contract_config(chain_id: ChainId, neg_risk: bool) -> Option<ContractConfig> {
+    let base = CONFIG.get(&chain_id).copied()?;
+    if neg_risk {
+        // Swap `exchange` and `exchange_v2` to the neg-risk addresses so existing
+        // call sites that read `.exchange` keep working without reshaping.
+        Some(ContractConfig {
+            exchange: base.neg_risk_exchange?,
+            exchange_v2: base.neg_risk_exchange_v2,
+            ..base
+        })
     } else {
-        CONFIG.get(&chain_id)
+        Some(base)
     }
 }
 
@@ -145,6 +154,36 @@ pub fn contract_config(chain_id: ChainId, is_neg_risk: bool) -> Option<&'static 
 #[must_use]
 pub fn wallet_contract_config(chain_id: ChainId) -> Option<&'static WalletContractConfig> {
     WALLET_CONFIG.get(&chain_id)
+}
+
+#[cfg(feature = "clob")]
+impl ContractConfig {
+    /// Addresses that must be granted USDC + CTF approvals for this
+    /// `OrderVersion`. Returns standard exchange + neg-risk exchange (if any)
+    /// for that version, plus the neg-risk adapter (shared across versions).
+    pub fn approval_spenders(&self, version: OrderVersion) -> Vec<Address> {
+        let mut out = Vec::with_capacity(3);
+        match version {
+            OrderVersion::V1 => {
+                out.push(self.exchange);
+                if let Some(nre) = self.neg_risk_exchange {
+                    out.push(nre);
+                }
+            }
+            OrderVersion::V2 => {
+                if let Some(ex) = self.exchange_v2 {
+                    out.push(ex);
+                }
+                if let Some(nre) = self.neg_risk_exchange_v2 {
+                    out.push(nre);
+                }
+            }
+        }
+        if let Some(adapter) = self.neg_risk_adapter {
+            out.push(adapter);
+        }
+        out
+    }
 }
 
 /// Derives the Polymarket Proxy wallet address for an EOA using CREATE2.
@@ -400,5 +439,58 @@ mod tests {
         // Unsupported chain should return None
         assert!(derive_proxy_wallet(eoa, 1).is_none());
         assert!(derive_safe_wallet(eoa, 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod contract_config_v2_tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn mainnet_has_v2_exchanges() {
+        let cfg = contract_config(POLYGON, false).unwrap();
+        assert_eq!(
+            cfg.exchange_v2,
+            Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+        );
+        assert_eq!(
+            cfg.neg_risk_exchange_v2,
+            Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
+        );
+    }
+
+    #[test]
+    fn amoy_has_v2_exchanges() {
+        let cfg = contract_config(AMOY, false).unwrap();
+        assert_eq!(
+            cfg.exchange_v2,
+            Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+        );
+    }
+
+    #[test]
+    fn approval_spenders_v1_includes_standard_and_neg_risk() {
+        use super::OrderVersion;
+        let cfg = contract_config(POLYGON, false).unwrap();
+        let spenders = cfg.approval_spenders(OrderVersion::V1);
+        assert!(spenders.contains(&cfg.exchange));
+        assert!(spenders.contains(&cfg.neg_risk_exchange.unwrap()));
+        assert!(spenders.contains(&cfg.neg_risk_adapter.unwrap()));
+        // V2 addresses must NOT leak into V1 set
+        assert!(!spenders.contains(&cfg.exchange_v2.unwrap()));
+    }
+
+    #[test]
+    fn approval_spenders_v2_includes_v2_and_shared_adapter() {
+        use super::OrderVersion;
+        let cfg = contract_config(POLYGON, false).unwrap();
+        let spenders = cfg.approval_spenders(OrderVersion::V2);
+        assert!(spenders.contains(&cfg.exchange_v2.unwrap()));
+        assert!(spenders.contains(&cfg.neg_risk_exchange_v2.unwrap()));
+        // Neg-risk adapter is shared across versions
+        assert!(spenders.contains(&cfg.neg_risk_adapter.unwrap()));
+        // V1-only addresses must NOT leak into V2 set
+        assert!(!spenders.contains(&cfg.exchange));
     }
 }

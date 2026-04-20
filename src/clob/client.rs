@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::U256;
+use alloy::primitives::{FixedBytes, U256};
 use alloy::signers::Signer;
 use alloy::sol_types::SolStruct as _;
 use async_stream::try_stream;
@@ -52,7 +52,10 @@ use crate::clob::types::{
     CreateRfqRequestRequest, CreateRfqRequestResponse, RfqQuote, RfqQuotesRequest, RfqRequest,
     RfqRequestsRequest,
 };
-use crate::clob::types::{SignableOrder, SignatureType, SignedOrder, TickSize};
+use crate::clob::types::{
+    AnySignableOrder, AnySignedOrder, OrderVersion, SignableOrder, SignableOrderV2, SignatureType,
+    SignedOrder, SignedOrderV2, TickSize,
+};
 use crate::error::{Error, Kind as ErrorKind, Synchronization};
 use crate::types::Address;
 use crate::{
@@ -62,8 +65,23 @@ use crate::{
 
 const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF Exchange"));
 const VERSION: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
+const VERSION_V2: Option<Cow<'static, str>> = Some(Cow::Borrowed("2"));
 
 const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
+
+/// Build the V2 EIP-712 domain for a given chain + neg-risk flag. Exposed for
+/// test / golden-vector parity.
+pub fn v2_domain_for_test(chain_id: u64, neg_risk: bool) -> Option<Eip712Domain> {
+    let cfg = contract_config(chain_id, neg_risk)?;
+    let ex = cfg.exchange_v2?;
+    Some(Eip712Domain {
+        name: ORDER_NAME,
+        version: VERSION_V2,
+        chain_id: Some(U256::from(chain_id)),
+        verifying_contract: Some(ex),
+        ..Eip712Domain::default()
+    })
+}
 
 /// The type used to build a request to authenticate the inner [`Client<Unauthorized>`]. Calling
 /// `authenticate` on this will elevate that inner `client` into an [`Client<Authenticated<K>>`].
@@ -1497,6 +1515,73 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Sign an order (V1 or V2). Dispatches on `AnySignableOrder` variant and
+    /// uses the corresponding EIP-712 domain for the signing hash.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "No need to publicly document as we are guarded by the typestate pattern. \
+        We cannot call `sign_any_order` without first calling `authenticate`"
+    )]
+    pub async fn sign_any_order(
+        &self,
+        signer: &(impl Signer + Send + Sync),
+        order: AnySignableOrder,
+    ) -> Result<AnySignedOrder> {
+        match order {
+            AnySignableOrder::V1(s) => {
+                let signed = self.sign(signer, s).await?;
+                Ok(AnySignedOrder::V1(signed))
+            }
+            AnySignableOrder::V2(SignableOrderV2 { order, order_type, post_only, .. }) => {
+                let chain_id = signer.chain_id().expect("chain_id set");
+                let token_id = order.tokenId;
+                let neg_risk = self.neg_risk(token_id).await?.neg_risk;
+                let cfg = contract_config(chain_id, neg_risk)
+                    .ok_or_else(|| Error::missing_contract_config(chain_id, neg_risk))?;
+                let exchange_v2 = cfg.exchange_v2
+                    .ok_or_else(|| Error::validation("V2 exchange not configured for chain"))?;
+
+                let domain = Eip712Domain {
+                    name: ORDER_NAME,
+                    version: VERSION_V2,
+                    chain_id: Some(U256::from(chain_id)),
+                    verifying_contract: Some(exchange_v2),
+                    ..Eip712Domain::default()
+                };
+
+                let signature = signer.sign_hash(&order.eip712_signing_hash(&domain)).await?;
+
+                let builder = SignedOrderV2::builder()
+                    .order(order)
+                    .signature(signature)
+                    .order_type(order_type)
+                    .owner(self.state().credentials.key);
+                let signed = match post_only {
+                    Some(po) => builder.post_only(po).build(),
+                    None => builder.build(),
+                };
+                Ok(AnySignedOrder::V2(signed))
+            }
+        }
+    }
+
+    /// Post a signed order (V1 or V2) to the orderbook. URL is unchanged
+    /// between versions; body shape is handled by `AnySignedOrder`'s Serialize.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order signature is invalid or the request fails.
+    pub async fn post_any_order(&self, signed: AnySignedOrder) -> Result<PostOrderResponse> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}order", self.host()))
+            .json(&signed)
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
     /// Posts multiple signed orders to the orderbook in a single request.
     ///
     /// This is the batch version of [`Self::post_order`], allowing efficient
@@ -2127,6 +2212,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             taker: None,
             order_type: None,
             post_only: Some(false),
+            order_version: OrderVersion::V1,
+            metadata: FixedBytes::<32>::ZERO,
+            builder_field: FixedBytes::<32>::ZERO,
             client: Client {
                 inner: Arc::clone(&self.inner),
                 #[cfg(feature = "heartbeats")]

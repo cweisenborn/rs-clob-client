@@ -474,6 +474,27 @@ Beyond basic order placement, the CLOB client supports:
 
 See [`examples/clob/authenticated.rs`](examples/clob/authenticated.rs) for comprehensive usage.
 
+## V2 Orders
+
+Runtime opt-in via `OrderVersion::V2` on the builder, or set as a client default:
+
+```rust
+use polymarket_client_sdk::clob::types::OrderVersion;
+
+// Per-order opt-in
+let order = OrderBuilder::limit(/* ... */)
+    .version(OrderVersion::V2)
+    .token_id(token_id)
+    .price(price)
+    .size(size)
+    .build_any()
+    .await?;
+let signed = client.sign_any_order(&signer, order).await?;
+let response = client.post_any_order(signed).await?;
+```
+
+V2 requires separate on-chain approvals for the V2 exchange contracts (different addresses from V1). See downstream wallet implementations for the approval flow.
+
 ## Token Allowances
 
 ### Do I need to set allowances?

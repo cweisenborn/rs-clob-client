@@ -1,0 +1,42 @@
+{
+  "eip712": {
+    "signing_hash": "0x8506417752ed8d53f2ec27c1c2d99b2afa049b3a332c1d9ea0162e7a6ddbf1a2",
+    "struct_hash": "0xe497dc2c167f2c6c32bc0634810a2870a5beeede1614829550a3eaa8a3eaa7ce"
+  },
+  "input": {
+    "chain_id": 137,
+    "order": {
+      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "makerAmount": "1000000",
+      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "salt": "7654321",
+      "side": "SELL",
+      "signatureType": 0,
+      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "takerAmount": "2000000",
+      "timestamp": "1713600000",
+      "tokenId": "12345678901234567890"
+    },
+    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
+  },
+  "json_body": {
+    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "expiration": "0",
+    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+    "makerAmount": "1000000",
+    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "salt": 7654321,
+    "side": "SELL",
+    "signature": "0x6888eb3323404a9b2972d8e2293af206d63cd30e9428fca18635df8e77e7c5de641ac13a774dd90ee5a4893f8e6bbd54e911f377cbb196e1eb3cd5d7868709991c",
+    "signatureType": 0,
+    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+    "takerAmount": "2000000",
+    "timestamp": "1713600000",
+    "tokenId": "12345678901234567890"
+  },
+  "signature": {
+    "full": "0x6888eb3323404a9b2972d8e2293af206d63cd30e9428fca18635df8e77e7c5de641ac13a774dd90ee5a4893f8e6bbd54e911f377cbb196e1eb3cd5d7868709991c"
+  }
+}

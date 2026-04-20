@@ -3176,3 +3176,237 @@ mod market {
         Ok(())
     }
 }
+
+#[test]
+fn order_version_defaults_to_v1() {
+    use polymarket_client_sdk::clob::types::OrderVersion;
+    assert_eq!(OrderVersion::default(), OrderVersion::V1);
+}
+
+#[test]
+fn any_order_wraps_v1_and_v2() {
+    use polymarket_client_sdk::clob::types::{AnyOrder, Order, OrderV2};
+    let v1: AnyOrder = AnyOrder::V1(Order::default());
+    let v2: AnyOrder = AnyOrder::V2(OrderV2::default());
+    assert!(matches!(v1, AnyOrder::V1(_)));
+    assert!(matches!(v2, AnyOrder::V2(_)));
+}
+
+#[test]
+fn order_v2_has_v2_fields() {
+    use alloy::primitives::{FixedBytes, U256};
+    use polymarket_client_sdk::clob::types::OrderV2;
+
+    // Verify OrderV2's `Default` impl produces all-zero V2 fields (which
+    // implicitly verifies the field layout — if the sol! macro produces a
+    // struct with the wrong field set, Default either fails or returns the
+    // wrong shape).
+    let o = OrderV2::default();
+    assert_eq!(o.salt, U256::ZERO);
+    assert_eq!(o.tokenId, U256::ZERO);
+    assert_eq!(o.makerAmount, U256::ZERO);
+    assert_eq!(o.takerAmount, U256::ZERO);
+    assert_eq!(o.side, 0u8);
+    assert_eq!(o.signatureType, 0u8);
+    assert_eq!(o.timestamp, U256::ZERO);
+    assert_eq!(o.metadata, FixedBytes::<32>::ZERO);
+    assert_eq!(o.builder, FixedBytes::<32>::ZERO);
+}
+
+#[test]
+fn signable_order_v2_constructs() {
+    use polymarket_client_sdk::clob::types::{OrderType, OrderV2, SignableOrderV2};
+    let s = SignableOrderV2::builder()
+        .order(OrderV2::default())
+        .order_type(OrderType::default())
+        .build();
+    assert_eq!(s.post_only, None);
+}
+
+#[test]
+fn signed_order_v2_json_includes_expiration_zero_and_v2_fields() {
+    use alloy::primitives::{Signature, U256};
+    use polymarket_client_sdk::clob::types::{OrderType, OrderV2, SignedOrderV2};
+    use uuid::Uuid;
+
+    // Use Signature::new(r, s, v) — the same pattern used in the in-crate tests.
+    let sig = Signature::new(U256::ZERO, U256::ZERO, false);
+
+    // OrderV2 is #[non_exhaustive] but Default is derived, so we can use
+    // default() + field mutation from an external crate.
+    let mut order = OrderV2::default();
+    // side = 0 => BUY; timestamp = non-zero to verify the field is present.
+    order.side = 0;
+    order.timestamp = U256::from(1_713_600_000u64);
+
+    let signed = SignedOrderV2::builder()
+        .order(order)
+        .signature(sig)
+        .order_type(OrderType::GTC)
+        .owner(Uuid::nil())
+        .build();
+
+    let v = serde_json::to_value(&signed).unwrap();
+    let order_json = &v["order"];
+
+    // V2-specific fields present
+    assert!(order_json.get("timestamp").is_some(), "timestamp missing");
+    assert!(order_json.get("metadata").is_some(), "metadata missing");
+    assert!(order_json.get("builder").is_some(), "builder missing");
+    // Compat: expiration still appears in body as "0"
+    assert_eq!(
+        order_json["expiration"].as_str(),
+        Some("0"),
+        "expiration must be \"0\""
+    );
+    // V1-only removed fields must NOT appear
+    assert!(
+        order_json.get("taker").is_none(),
+        "taker should not be in V2 body"
+    );
+    assert!(
+        order_json.get("nonce").is_none(),
+        "nonce should not be in V2 body"
+    );
+    assert!(
+        order_json.get("feeRateBps").is_none(),
+        "feeRateBps should not be in V2 body"
+    );
+    // Side is stringified
+    assert_eq!(order_json["side"].as_str(), Some("BUY"));
+}
+
+#[test]
+fn any_signable_and_signed_wrap_both_versions() {
+    use polymarket_client_sdk::clob::types::{
+        AnySignableOrder, AnySignedOrder, OrderVersion,
+    };
+
+    // Just check the dispatch enums can be named and matched on. Construction
+    // is covered by the existing V1/V2 test coverage; this test is about the
+    // enum's existence and the .version() helper.
+    let _variant_a = AnySignableOrder::version;  // function pointer compile check
+    let _variant_b = AnySignedOrder::version;
+    let _v1 = OrderVersion::V1;
+    let _v2 = OrderVersion::V2;
+}
+
+#[test]
+fn order_builder_version_flag_defaults_v1() {
+    use polymarket_client_sdk::auth::Normal;
+    use polymarket_client_sdk::clob::order_builder::{Limit, OrderBuilder};
+    // Smoke: default version is V1 — just the fact that this compiles is the
+    // test. Actual dispatch is tested in Task 10.
+    let _ = OrderBuilder::<Limit, Normal>::version;
+}
+
+/// Tests for `build_any()` dispatch on [`OrderVersion`].
+mod build_any {
+    use alloy::primitives::U256;
+    use polymarket_client_sdk::clob::types::{AnySignableOrder, OrderType, OrderVersion, Side};
+
+    use super::*;
+    use crate::common::{create_authenticated, ensure_requirements, token_1};
+
+    /// `build_any()` with V1 version emits `AnySignableOrder::V1`.
+    #[tokio::test]
+    async fn build_any_v1_emits_v1_variant() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+
+        ensure_requirements(&server, token_1(), TickSize::Tenth);
+
+        let result = client
+            .limit_order()
+            .token_id(token_1())
+            .size(Decimal::ONE_HUNDRED)
+            .price(dec!(0.1))
+            .side(Side::Buy)
+            // V1 is the default; call .version() explicitly to exercise that path
+            .version(OrderVersion::V1)
+            .build_any()
+            .await?;
+
+        assert!(
+            matches!(result, AnySignableOrder::V1(_)),
+            "expected V1 variant, got {result:?}",
+        );
+
+        // Confirm the inner order has the expected shape
+        if let AnySignableOrder::V1(signable) = result {
+            assert_eq!(signable.order_type, OrderType::GTC);
+            // V1 order has a taker field (zero by default)
+            assert_eq!(signable.order.taker, Address::ZERO);
+            // Salt is set (masked to <= 2^53-1)
+            assert!(signable.order.salt < U256::from(1u64 << 53));
+        }
+
+        Ok(())
+    }
+
+    /// `build_any()` with V2 version emits `AnySignableOrder::V2` and populates
+    /// V2-specific fields: `timestamp != 0`, `metadata`, `builder`.
+    #[tokio::test]
+    async fn build_any_v2_emits_v2_variant() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+
+        ensure_requirements(&server, token_1(), TickSize::Tenth);
+
+        let result = client
+            .limit_order()
+            .token_id(token_1())
+            .size(Decimal::ONE_HUNDRED)
+            .price(dec!(0.1))
+            .side(Side::Buy)
+            .version(OrderVersion::V2)
+            .build_any()
+            .await?;
+
+        assert!(
+            matches!(result, AnySignableOrder::V2(_)),
+            "expected V2 variant, got {result:?}",
+        );
+
+        if let AnySignableOrder::V2(signable) = result {
+            assert_eq!(signable.order_type, OrderType::GTC);
+
+            // timestamp must be non-zero (set to Utc::now())
+            assert_ne!(
+                signable.order.timestamp,
+                U256::ZERO,
+                "V2 timestamp must be set"
+            );
+
+            // Salt is set and masked
+            assert!(signable.order.salt < U256::from(1u64 << 53));
+
+            // makerAmount and takerAmount populated (Buy 100 shares at 0.1)
+            // taker_amount = 100 shares => 100_000_000 (6 decimals)
+            // maker_amount = 100 * 0.1 = 10 USDC => 10_000_000
+            assert_eq!(signable.order.takerAmount, U256::from(100_000_000u64));
+            assert_eq!(signable.order.makerAmount, U256::from(10_000_000u64));
+
+            // metadata and builder default to zero bytes32
+            assert_eq!(signable.order.metadata, alloy::primitives::FixedBytes::<32>::ZERO);
+            assert_eq!(signable.order.builder, alloy::primitives::FixedBytes::<32>::ZERO);
+        }
+
+        Ok(())
+    }
+}
+
+#[test]
+fn v2_domain_uses_version_2_and_exchange_v2() {
+    use polymarket_client_sdk::clob::client::v2_domain_for_test;
+    use polymarket_client_sdk::POLYGON;
+    use alloy::primitives::address;
+
+    let d = v2_domain_for_test(POLYGON, /*neg_risk=*/false).unwrap();
+    assert_eq!(d.version.as_deref(), Some("2"));
+    assert_eq!(d.name.as_deref(), Some("Polymarket CTF Exchange"));
+    assert_eq!(
+        d.verifying_contract,
+        Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+    );
+}

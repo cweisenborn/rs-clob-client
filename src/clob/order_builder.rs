@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::U256;
+use alloy::primitives::{FixedBytes, U256};
 use chrono::{DateTime, Utc};
 use rand::RngExt as _;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -12,7 +12,8 @@ use crate::auth::state::Authenticated;
 use crate::clob::Client;
 use crate::clob::types::request::OrderBookSummaryRequest;
 use crate::clob::types::{
-    Amount, AmountInner, Order, OrderType, Side, SignableOrder, SignatureType,
+    Amount, AmountInner, AnySignableOrder, Order, OrderType, OrderV2, OrderVersion, Side,
+    SignableOrder, SignableOrderV2, SignatureType,
 };
 use crate::error::Error;
 use crate::types::{Address, Decimal};
@@ -50,6 +51,9 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
     pub(crate) order_type: Option<OrderType>,
     pub(crate) post_only: Option<bool>,
     pub(crate) funder: Option<Address>,
+    pub(crate) order_version: OrderVersion,
+    pub(crate) metadata: FixedBytes<32>,
+    pub(crate) builder_field: FixedBytes<32>,
     pub(crate) _kind: PhantomData<OrderKind>,
 }
 
@@ -97,6 +101,29 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
     #[must_use]
     pub fn post_only(mut self, post_only: bool) -> Self {
         self.post_only = Some(post_only);
+        self
+    }
+
+    /// Opt into V2 order signing for this builder. Defaults to V1.
+    #[must_use]
+    pub fn version(mut self, v: OrderVersion) -> Self {
+        self.order_version = v;
+        self
+    }
+
+    /// V2-only: set the `metadata` bytes32 field. Defaults to all zero.
+    /// Silently ignored for V1 orders (V1 has no metadata field).
+    #[must_use]
+    pub fn metadata(mut self, m: FixedBytes<32>) -> Self {
+        self.metadata = m;
+        self
+    }
+
+    /// V2-only: set the `builder` bytes32 field. Defaults to all zero.
+    /// Silently ignored for V1 orders.
+    #[must_use]
+    pub fn builder(mut self, b: FixedBytes<32>) -> Self {
+        self.builder_field = b;
         self
     }
 }
@@ -252,6 +279,148 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         tracing::debug!(token_id = %token_id, side = ?side, price = %price, size = %size, "limit order built");
 
         Ok(SignableOrder {
+            order,
+            order_type,
+            post_only,
+        })
+    }
+
+    /// Build into an [`AnySignableOrder`], dispatching on the builder's configured
+    /// `order_version`. V1 produces the existing [`SignableOrder`]; V2 produces
+    /// [`SignableOrderV2`] with the V2 field layout.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), err(level = "warn"))
+    )]
+    pub async fn build_any(self) -> Result<AnySignableOrder> {
+        match self.order_version {
+            OrderVersion::V1 => Ok(AnySignableOrder::V1(self.build().await?)),
+            OrderVersion::V2 => Ok(AnySignableOrder::V2(self.build_v2().await?)),
+        }
+    }
+
+    /// Internal: build a V2 signable order. Mirrors [`build`] but targets
+    /// [`OrderV2`] fields. `taker`, `nonce`, `fee_rate_bps`, and `expiration`
+    /// are not part of the V2 EIP-712 digest. `metadata` and `builder` are
+    /// picked up from the builder's state (default zero).
+    async fn build_v2(self) -> Result<SignableOrderV2> {
+        let Some(token_id) = self.token_id else {
+            return Err(Error::validation(
+                "Unable to build Order due to missing token ID",
+            ));
+        };
+
+        let Some(side) = self.side else {
+            return Err(Error::validation(
+                "Unable to build Order due to missing token side",
+            ));
+        };
+
+        let Some(price) = self.price else {
+            return Err(Error::validation(
+                "Unable to build Order due to missing price",
+            ));
+        };
+
+        if price.is_sign_negative() {
+            return Err(Error::validation(format!(
+                "Unable to build Order due to negative price {price}"
+            )));
+        }
+
+        let minimum_tick_size = self
+            .client
+            .tick_size(token_id)
+            .await?
+            .minimum_tick_size
+            .as_decimal();
+
+        let decimals = minimum_tick_size.scale();
+
+        if price.scale() > minimum_tick_size.scale() {
+            return Err(Error::validation(format!(
+                "Unable to build Order: Price {price} has {} decimal places. Minimum tick size \
+                {minimum_tick_size} has {} decimal places. Price decimal places <= minimum tick size decimal places",
+                price.scale(),
+                minimum_tick_size.scale()
+            )));
+        }
+
+        if price < minimum_tick_size || price > Decimal::ONE - minimum_tick_size {
+            return Err(Error::validation(format!(
+                "Price {price} is too small or too large for the minimum tick size {minimum_tick_size}"
+            )));
+        }
+
+        let Some(size) = self.size else {
+            return Err(Error::validation(
+                "Unable to build Order due to missing size",
+            ));
+        };
+
+        if size.scale() > LOT_SIZE_SCALE {
+            return Err(Error::validation(format!(
+                "Unable to build Order: Size {size} has {} decimal places. Maximum lot size is {LOT_SIZE_SCALE}",
+                size.scale()
+            )));
+        }
+
+        if size.is_zero() || size.is_sign_negative() {
+            return Err(Error::validation(format!(
+                "Unable to build Order due to negative size {size}"
+            )));
+        }
+
+        let order_type = self.order_type.unwrap_or(OrderType::GTC);
+        let post_only = Some(self.post_only.unwrap_or(false));
+
+        // V2 does not use expiration in the signing digest; we skip the GTD/expiration
+        // validation that V1 enforces since expiration is not relevant to V2 orders.
+
+        if post_only == Some(true) && !matches!(order_type, OrderType::GTC | OrderType::GTD) {
+            return Err(Error::validation(
+                "postOnly is only supported for GTC and GTD orders",
+            ));
+        }
+
+        // Same maker/taker amount computation as V1 — only the struct shape changes.
+        let (taker_amount, maker_amount) = match side {
+            Side::Buy => (
+                size,
+                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+            ),
+            Side::Sell => (
+                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+                size,
+            ),
+            side => return Err(Error::validation(format!("Invalid side: {side}"))),
+        };
+
+        let salt = to_ieee_754_int((self.salt_generator)());
+
+        let timestamp = U256::from(
+            u64::try_from(Utc::now().timestamp())
+                .unwrap_or(0),
+        );
+
+        let order = OrderV2 {
+            salt: U256::from(salt),
+            maker: self.funder.unwrap_or(self.signer),
+            signer: self.signer,
+            tokenId: token_id,
+            makerAmount: U256::from(to_fixed_u128(maker_amount)),
+            takerAmount: U256::from(to_fixed_u128(taker_amount)),
+            side: side as u8,
+            signatureType: self.signature_type as u8,
+            timestamp,
+            metadata: self.metadata,
+            builder: self.builder_field,
+        };
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(token_id = %token_id, side = ?side, price = %price, size = %size, "V2 limit order built");
+
+        Ok(SignableOrderV2 {
             order,
             order_type,
             post_only,

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Polymarket/rs-clob-client/compare/v0.4.4...v0.5.0) - 2026-04-19
+
+### Added
+
+- V2 order support (`OrderV2`, `SignableOrderV2`, `SignedOrderV2`) behind runtime `OrderVersion` flag. V1 remains default.
+- `ContractConfig::approval_spenders(version)` returns the USDC + CTF approval targets for a given version.
+- V2 EIP-712 domain (`version: "2"`) with V2 exchange contracts `0xE111180000d2663C0091e4f400237545B87B996B` and `0xe2222d279d744050d28e00520010520000310F59`.
+- `OrderBuilder::version()`, `metadata()`, `builder()` setters for V2-specific fields.
+- `OrderBuilder::build_any()`, `Client::sign_any_order()`, `Client::post_any_order()` dispatch entry points.
+- `AnyOrder`, `AnySignableOrder`, `AnySignedOrder` dispatch enums.
+- Python fixture generator (`tests/fixtures/gen_v2_vectors.py`) + 7 golden-vector signing tests covering EOA/POLY_PROXY/POLY_GNOSIS_SAFE signature types, standard/neg-risk exchanges, mainnet/Amoy chains, zero and non-zero `metadata`/`builder`, and BUY + SELL sides.
+
+### Changed
+
+- Collapsed `CONFIG` + `NEG_RISK_CONFIG` phf_maps into a single richer `CONFIG`.
+- `ContractConfig` gains `exchange_v2`, `neg_risk_exchange`, `neg_risk_exchange_v2` fields.
+- `contract_config(chain_id, neg_risk)` now returns an owned `ContractConfig` (via `Copy` derive) instead of `Option<&'static ContractConfig>`.
+- `#[non_exhaustive]` removed from `ContractConfig` (to allow `phf_map!` static construction). All fields are `pub` and semver-breaking additions going forward should bump minor.
+
+### Not changed
+
+- V1 order path (struct, signing, POST body) is byte-identical to 0.4.4.
+- WebSocket, Gamma, CTF, data API, RFQ, heartbeats features — fully unchanged.
+- HMAC (L2 auth) computation — byte-identical to V1.
+- `POST /orders` endpoint URL — same for V1 and V2; server detects version by body shape.
+
 ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
 
 ### Fixed

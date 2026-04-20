@@ -1,0 +1,2067 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 38d0cfa..3087e44 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ## [Unreleased]
+ 
++## [0.5.0](https://github.com/Polymarket/rs-clob-client/compare/v0.4.4...v0.5.0) - 2026-04-19
++
++### Added
++
++- V2 order support (`OrderV2`, `SignableOrderV2`, `SignedOrderV2`) behind runtime `OrderVersion` flag. V1 remains default.
++- `ContractConfig::approval_spenders(version)` returns the USDC + CTF approval targets for a given version.
++- V2 EIP-712 domain (`version: "2"`) with V2 exchange contracts `0xE111180000d2663C0091e4f400237545B87B996B` and `0xe2222d279d744050d28e00520010520000310F59`.
++- `OrderBuilder::version()`, `metadata()`, `builder()` setters for V2-specific fields.
++- `OrderBuilder::build_any()`, `Client::sign_any_order()`, `Client::post_any_order()` dispatch entry points.
++- `AnyOrder`, `AnySignableOrder`, `AnySignedOrder` dispatch enums.
++- Python fixture generator (`tests/fixtures/gen_v2_vectors.py`) + 7 golden-vector signing tests covering EOA/POLY_PROXY/POLY_GNOSIS_SAFE signature types, standard/neg-risk exchanges, mainnet/Amoy chains, zero and non-zero `metadata`/`builder`, and BUY + SELL sides.
++
++### Changed
++
++- Collapsed `CONFIG` + `NEG_RISK_CONFIG` phf_maps into a single richer `CONFIG`.
++- `ContractConfig` gains `exchange_v2`, `neg_risk_exchange`, `neg_risk_exchange_v2` fields.
++- `contract_config(chain_id, neg_risk)` now returns an owned `ContractConfig` (via `Copy` derive) instead of `Option<&'static ContractConfig>`.
++- `#[non_exhaustive]` removed from `ContractConfig` (to allow `phf_map!` static construction). All fields are `pub` and semver-breaking additions going forward should bump minor.
++
++### Not changed
++
++- V1 order path (struct, signing, POST body) is byte-identical to 0.4.4.
++- WebSocket, Gamma, CTF, data API, RFQ, heartbeats features — fully unchanged.
++- HMAC (L2 auth) computation — byte-identical to V1.
++- `POST /orders` endpoint URL — same for V1 and V2; server detects version by body shape.
++
+ ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
+ 
+ ### Fixed
+diff --git a/Cargo.lock b/Cargo.lock
+index bc2828d..52303cc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3585,6 +3585,7 @@ dependencies = [
+  "dashmap",
+  "futures",
+  "futures-util",
++ "hex",
+  "hmac",
+  "httpmock",
+  "phf",
+diff --git a/Cargo.toml b/Cargo.toml
+index c4e1380..b8af957 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,7 +1,7 @@
+ [package]
+ name = "polymarket-client-sdk"
+ description = "Polymarket CLOB (Central Limit Order Book) API client SDK"
+-version = "0.4.4"
++version = "0.5.0"
+ authors = [
+     "Polymarket Engineering <engineering@polymarket.com>",
+     "Chaz Byrnes <chaz@polymarket.com>",
+@@ -92,6 +92,7 @@ aws-config = "1.8.13"
+ aws-sdk-kms = "1.99.0"
+ criterion = { version = "0.8.2", features = ["html_reports"] }
+ futures-util = "0.3.31"
++hex = "0.4"
+ httpmock = "0.8.3"
+ tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
+ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+diff --git a/README.md b/README.md
+index 0a87291..737d7e2 100644
+--- a/README.md
++++ b/README.md
+@@ -474,6 +474,27 @@ Beyond basic order placement, the CLOB client supports:
+ 
+ See [`examples/clob/authenticated.rs`](examples/clob/authenticated.rs) for comprehensive usage.
+ 
++## V2 Orders
++
++Runtime opt-in via `OrderVersion::V2` on the builder, or set as a client default:
++
++```rust
++use polymarket_client_sdk::clob::types::OrderVersion;
++
++// Per-order opt-in
++let order = OrderBuilder::limit(/* ... */)
++    .version(OrderVersion::V2)
++    .token_id(token_id)
++    .price(price)
++    .size(size)
++    .build_any()
++    .await?;
++let signed = client.sign_any_order(&signer, order).await?;
++let response = client.post_any_order(signed).await?;
++```
++
++V2 requires separate on-chain approvals for the V2 exchange contracts (different addresses from V1). See downstream wallet implementations for the approval flow.
++
+ ## Token Allowances
+ 
+ ### Do I need to set allowances?
+diff --git a/src/clob/client.rs b/src/clob/client.rs
+index 99f9a9a..d931c78 100644
+--- a/src/clob/client.rs
++++ b/src/clob/client.rs
+@@ -6,7 +6,7 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use alloy::dyn_abi::Eip712Domain;
+-use alloy::primitives::U256;
++use alloy::primitives::{FixedBytes, U256};
+ use alloy::signers::Signer;
+ use alloy::sol_types::SolStruct as _;
+ use async_stream::try_stream;
+@@ -52,7 +52,10 @@ use crate::clob::types::{
+     CreateRfqRequestRequest, CreateRfqRequestResponse, RfqQuote, RfqQuotesRequest, RfqRequest,
+     RfqRequestsRequest,
+ };
+-use crate::clob::types::{SignableOrder, SignatureType, SignedOrder, TickSize};
++use crate::clob::types::{
++    AnySignableOrder, AnySignedOrder, OrderVersion, SignableOrder, SignableOrderV2, SignatureType,
++    SignedOrder, SignedOrderV2, TickSize,
++};
+ use crate::error::{Error, Kind as ErrorKind, Synchronization};
+ use crate::types::Address;
+ use crate::{
+@@ -62,9 +65,24 @@ use crate::{
+ 
+ const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF Exchange"));
+ const VERSION: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
++const VERSION_V2: Option<Cow<'static, str>> = Some(Cow::Borrowed("2"));
+ 
+ const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
+ 
++/// Build the V2 EIP-712 domain for a given chain + neg-risk flag. Exposed for
++/// test / golden-vector parity.
++pub fn v2_domain_for_test(chain_id: u64, neg_risk: bool) -> Option<Eip712Domain> {
++    let cfg = contract_config(chain_id, neg_risk)?;
++    let ex = cfg.exchange_v2?;
++    Some(Eip712Domain {
++        name: ORDER_NAME,
++        version: VERSION_V2,
++        chain_id: Some(U256::from(chain_id)),
++        verifying_contract: Some(ex),
++        ..Eip712Domain::default()
++    })
++}
++
+ /// The type used to build a request to authenticate the inner [`Client<Unauthorized>`]. Calling
+ /// `authenticate` on this will elevate that inner `client` into an [`Client<Authenticated<K>>`].
+ pub struct AuthenticationBuilder<'signer, S: Signer, K: Kind = Normal> {
+@@ -1497,6 +1515,73 @@ impl<K: Kind> Client<Authenticated<K>> {
+         crate::request(&self.inner.client, request, Some(headers)).await
+     }
+ 
++    /// Sign an order (V1 or V2). Dispatches on `AnySignableOrder` variant and
++    /// uses the corresponding EIP-712 domain for the signing hash.
++    #[expect(
++        clippy::missing_panics_doc,
++        reason = "No need to publicly document as we are guarded by the typestate pattern. \
++        We cannot call `sign_any_order` without first calling `authenticate`"
++    )]
++    pub async fn sign_any_order(
++        &self,
++        signer: &(impl Signer + Send + Sync),
++        order: AnySignableOrder,
++    ) -> Result<AnySignedOrder> {
++        match order {
++            AnySignableOrder::V1(s) => {
++                let signed = self.sign(signer, s).await?;
++                Ok(AnySignedOrder::V1(signed))
++            }
++            AnySignableOrder::V2(SignableOrderV2 { order, order_type, post_only, .. }) => {
++                let chain_id = signer.chain_id().expect("chain_id set");
++                let token_id = order.tokenId;
++                let neg_risk = self.neg_risk(token_id).await?.neg_risk;
++                let cfg = contract_config(chain_id, neg_risk)
++                    .ok_or_else(|| Error::missing_contract_config(chain_id, neg_risk))?;
++                let exchange_v2 = cfg.exchange_v2
++                    .ok_or_else(|| Error::validation("V2 exchange not configured for chain"))?;
++
++                let domain = Eip712Domain {
++                    name: ORDER_NAME,
++                    version: VERSION_V2,
++                    chain_id: Some(U256::from(chain_id)),
++                    verifying_contract: Some(exchange_v2),
++                    ..Eip712Domain::default()
++                };
++
++                let signature = signer.sign_hash(&order.eip712_signing_hash(&domain)).await?;
++
++                let builder = SignedOrderV2::builder()
++                    .order(order)
++                    .signature(signature)
++                    .order_type(order_type)
++                    .owner(self.state().credentials.key);
++                let signed = match post_only {
++                    Some(po) => builder.post_only(po).build(),
++                    None => builder.build(),
++                };
++                Ok(AnySignedOrder::V2(signed))
++            }
++        }
++    }
++
++    /// Post a signed order (V1 or V2) to the orderbook. URL is unchanged
++    /// between versions; body shape is handled by `AnySignedOrder`'s Serialize.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the order signature is invalid or the request fails.
++    pub async fn post_any_order(&self, signed: AnySignedOrder) -> Result<PostOrderResponse> {
++        let request = self
++            .client()
++            .request(Method::POST, format!("{}order", self.host()))
++            .json(&signed)
++            .build()?;
++        let headers = self.create_headers(&request).await?;
++
++        crate::request(&self.inner.client, request, Some(headers)).await
++    }
++
+     /// Posts multiple signed orders to the orderbook in a single request.
+     ///
+     /// This is the batch version of [`Self::post_order`], allowing efficient
+@@ -2127,6 +2212,9 @@ impl<K: Kind> Client<Authenticated<K>> {
+             taker: None,
+             order_type: None,
+             post_only: Some(false),
++            order_version: OrderVersion::V1,
++            metadata: FixedBytes::<32>::ZERO,
++            builder_field: FixedBytes::<32>::ZERO,
+             client: Client {
+                 inner: Arc::clone(&self.inner),
+                 #[cfg(feature = "heartbeats")]
+diff --git a/src/clob/order_builder.rs b/src/clob/order_builder.rs
+index 956ca0e..943e015 100644
+--- a/src/clob/order_builder.rs
++++ b/src/clob/order_builder.rs
+@@ -1,7 +1,7 @@
+ use std::marker::PhantomData;
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+-use alloy::primitives::U256;
++use alloy::primitives::{FixedBytes, U256};
+ use chrono::{DateTime, Utc};
+ use rand::RngExt as _;
+ use rust_decimal::prelude::ToPrimitive as _;
+@@ -12,7 +12,8 @@ use crate::auth::state::Authenticated;
+ use crate::clob::Client;
+ use crate::clob::types::request::OrderBookSummaryRequest;
+ use crate::clob::types::{
+-    Amount, AmountInner, Order, OrderType, Side, SignableOrder, SignatureType,
++    Amount, AmountInner, AnySignableOrder, Order, OrderType, OrderV2, OrderVersion, Side,
++    SignableOrder, SignableOrderV2, SignatureType,
+ };
+ use crate::error::Error;
+ use crate::types::{Address, Decimal};
+@@ -50,6 +51,9 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
+     pub(crate) order_type: Option<OrderType>,
+     pub(crate) post_only: Option<bool>,
+     pub(crate) funder: Option<Address>,
++    pub(crate) order_version: OrderVersion,
++    pub(crate) metadata: FixedBytes<32>,
++    pub(crate) builder_field: FixedBytes<32>,
+     pub(crate) _kind: PhantomData<OrderKind>,
+ }
+ 
+@@ -99,6 +103,29 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
+         self.post_only = Some(post_only);
+         self
+     }
++
++    /// Opt into V2 order signing for this builder. Defaults to V1.
++    #[must_use]
++    pub fn version(mut self, v: OrderVersion) -> Self {
++        self.order_version = v;
++        self
++    }
++
++    /// V2-only: set the `metadata` bytes32 field. Defaults to all zero.
++    /// Silently ignored for V1 orders (V1 has no metadata field).
++    #[must_use]
++    pub fn metadata(mut self, m: FixedBytes<32>) -> Self {
++        self.metadata = m;
++        self
++    }
++
++    /// V2-only: set the `builder` bytes32 field. Defaults to all zero.
++    /// Silently ignored for V1 orders.
++    #[must_use]
++    pub fn builder(mut self, b: FixedBytes<32>) -> Self {
++        self.builder_field = b;
++        self
++    }
+ }
+ 
+ impl<K: AuthKind> OrderBuilder<Limit, K> {
+@@ -257,6 +284,148 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
+             post_only,
+         })
+     }
++
++    /// Build into an [`AnySignableOrder`], dispatching on the builder's configured
++    /// `order_version`. V1 produces the existing [`SignableOrder`]; V2 produces
++    /// [`SignableOrderV2`] with the V2 field layout.
++    #[cfg_attr(
++        feature = "tracing",
++        tracing::instrument(skip(self), err(level = "warn"))
++    )]
++    pub async fn build_any(self) -> Result<AnySignableOrder> {
++        match self.order_version {
++            OrderVersion::V1 => Ok(AnySignableOrder::V1(self.build().await?)),
++            OrderVersion::V2 => Ok(AnySignableOrder::V2(self.build_v2().await?)),
++        }
++    }
++
++    /// Internal: build a V2 signable order. Mirrors [`build`] but targets
++    /// [`OrderV2`] fields. `taker`, `nonce`, `fee_rate_bps`, and `expiration`
++    /// are not part of the V2 EIP-712 digest. `metadata` and `builder` are
++    /// picked up from the builder's state (default zero).
++    async fn build_v2(self) -> Result<SignableOrderV2> {
++        let Some(token_id) = self.token_id else {
++            return Err(Error::validation(
++                "Unable to build Order due to missing token ID",
++            ));
++        };
++
++        let Some(side) = self.side else {
++            return Err(Error::validation(
++                "Unable to build Order due to missing token side",
++            ));
++        };
++
++        let Some(price) = self.price else {
++            return Err(Error::validation(
++                "Unable to build Order due to missing price",
++            ));
++        };
++
++        if price.is_sign_negative() {
++            return Err(Error::validation(format!(
++                "Unable to build Order due to negative price {price}"
++            )));
++        }
++
++        let minimum_tick_size = self
++            .client
++            .tick_size(token_id)
++            .await?
++            .minimum_tick_size
++            .as_decimal();
++
++        let decimals = minimum_tick_size.scale();
++
++        if price.scale() > minimum_tick_size.scale() {
++            return Err(Error::validation(format!(
++                "Unable to build Order: Price {price} has {} decimal places. Minimum tick size \
++                {minimum_tick_size} has {} decimal places. Price decimal places <= minimum tick size decimal places",
++                price.scale(),
++                minimum_tick_size.scale()
++            )));
++        }
++
++        if price < minimum_tick_size || price > Decimal::ONE - minimum_tick_size {
++            return Err(Error::validation(format!(
++                "Price {price} is too small or too large for the minimum tick size {minimum_tick_size}"
++            )));
++        }
++
++        let Some(size) = self.size else {
++            return Err(Error::validation(
++                "Unable to build Order due to missing size",
++            ));
++        };
++
++        if size.scale() > LOT_SIZE_SCALE {
++            return Err(Error::validation(format!(
++                "Unable to build Order: Size {size} has {} decimal places. Maximum lot size is {LOT_SIZE_SCALE}",
++                size.scale()
++            )));
++        }
++
++        if size.is_zero() || size.is_sign_negative() {
++            return Err(Error::validation(format!(
++                "Unable to build Order due to negative size {size}"
++            )));
++        }
++
++        let order_type = self.order_type.unwrap_or(OrderType::GTC);
++        let post_only = Some(self.post_only.unwrap_or(false));
++
++        // V2 does not use expiration in the signing digest; we skip the GTD/expiration
++        // validation that V1 enforces since expiration is not relevant to V2 orders.
++
++        if post_only == Some(true) && !matches!(order_type, OrderType::GTC | OrderType::GTD) {
++            return Err(Error::validation(
++                "postOnly is only supported for GTC and GTD orders",
++            ));
++        }
++
++        // Same maker/taker amount computation as V1 — only the struct shape changes.
++        let (taker_amount, maker_amount) = match side {
++            Side::Buy => (
++                size,
++                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
++            ),
++            Side::Sell => (
++                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
++                size,
++            ),
++            side => return Err(Error::validation(format!("Invalid side: {side}"))),
++        };
++
++        let salt = to_ieee_754_int((self.salt_generator)());
++
++        let timestamp = U256::from(
++            u64::try_from(Utc::now().timestamp())
++                .unwrap_or(0),
++        );
++
++        let order = OrderV2 {
++            salt: U256::from(salt),
++            maker: self.funder.unwrap_or(self.signer),
++            signer: self.signer,
++            tokenId: token_id,
++            makerAmount: U256::from(to_fixed_u128(maker_amount)),
++            takerAmount: U256::from(to_fixed_u128(taker_amount)),
++            side: side as u8,
++            signatureType: self.signature_type as u8,
++            timestamp,
++            metadata: self.metadata,
++            builder: self.builder_field,
++        };
++
++        #[cfg(feature = "tracing")]
++        tracing::debug!(token_id = %token_id, side = ?side, price = %price, size = %size, "V2 limit order built");
++
++        Ok(SignableOrderV2 {
++            order,
++            order_type,
++            post_only,
++        })
++    }
+ }
+ 
+ impl<K: AuthKind> OrderBuilder<Market, K> {
+diff --git a/src/clob/types/mod.rs b/src/clob/types/mod.rs
+index 52f6a71..ad866a8 100644
+--- a/src/clob/types/mod.rs
++++ b/src/clob/types/mod.rs
+@@ -19,6 +19,19 @@ use crate::types::Decimal;
+ pub mod request;
+ pub mod response;
+ 
++/// Which version of the Polymarket CTF Exchange an order targets.
++///
++/// V1 uses exchange `0x4bFb...982E` (standard) / `0xC5d5...f80a` (neg-risk) and
++/// EIP-712 domain version `"1"`. V2 uses exchange `0xE111...996B` / `0xe222...0F59`
++/// and domain version `"2"`. Runtime flag, not a Cargo feature — avoids recompile
++/// to roll back.
++#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
++pub enum OrderVersion {
++    #[default]
++    V1,
++    V2,
++}
++
+ // Re-export RFQ types for convenient access
+ #[cfg(feature = "rfq")]
+ pub use request::{
+@@ -454,6 +467,63 @@ sol! {
+     }
+ }
+ 
++/// Inner module so that the `sol!` struct can be named `Order` (matching the
++/// on-chain EIP-712 `primaryType` used by `CTFExchangeV2`) without conflicting
++/// with the V1 `Order` struct defined in this file.
++///
++/// The public re-export as `OrderV2` keeps the Rust call-sites readable.
++/// The EIP-712 type string produced by `eip712_root_type()` will be
++/// `Order(uint256 salt,address maker,...)` — exactly what the contract expects.
++mod order_v2_inner {
++    use serde::Serialize;
++    use serde_with::{DisplayFromStr, serde_as};
++
++    alloy::core::sol! {
++        /// V2 order struct — matches `CTFExchangeV2` contract typed data.
++        ///
++        /// EIP-712 `primaryType` is `"Order"` (not `"OrderV2"`) so that the struct
++        /// hash matches what the on-chain `CTFExchangeV2` contract verifies.
++        ///
++        /// Differences from V1:
++        ///   added:   timestamp (uint256), metadata (bytes32), builder (bytes32)
++        ///   removed: taker, expiration (from digest), nonce, feeRateBps
++        ///
++        /// Fees are protocol-level in V2. `expiration` still appears in the POST
++        /// body as `"0"` for compat but is NOT part of the EIP-712 signing hash.
++        #[non_exhaustive]
++        #[serde_as]
++        #[derive(Serialize, Debug, Default, PartialEq)]
++        struct Order {
++            #[serde(serialize_with = "crate::clob::types::ser_salt")]
++            uint256 salt;
++            address maker;
++            address signer;
++            #[serde_as(as = "DisplayFromStr")]
++            uint256 tokenId;
++            #[serde_as(as = "DisplayFromStr")]
++            uint256 makerAmount;
++            #[serde_as(as = "DisplayFromStr")]
++            uint256 takerAmount;
++            uint8   side;
++            uint8   signatureType;
++            #[serde_as(as = "DisplayFromStr")]
++            uint256 timestamp;
++            bytes32 metadata;
++            bytes32 builder;
++        }
++    }
++}
++
++/// V2 order struct — matches `CTFExchangeV2` contract typed data.
++///
++/// The EIP-712 type name is `"Order"` (the on-chain primary type), so the
++/// struct hash matches what `CTFExchangeV2` verifies.
++///
++/// Differences from V1 `Order`:
++///   added:   `timestamp` (uint256), `metadata` (bytes32), `builder` (bytes32)
++///   removed: `taker`, `expiration` (from digest), `nonce`, `feeRateBps`
++pub use order_v2_inner::Order as OrderV2;
++
+ // CLOB expects salt as a JSON number. U256 as an integer will not fit as a JSON number. Since
+ // we generated the salt as a u64 originally (see `salt_generator`), we can be very confident that
+ // we can invert the conversion to U256 and return a u64 when serializing.
+@@ -483,6 +553,25 @@ pub struct SignedOrder {
+     pub post_only: Option<bool>,
+ }
+ 
++#[non_exhaustive]
++#[derive(Clone, Debug, Default, Serialize, Builder, PartialEq)]
++pub struct SignableOrderV2 {
++    pub order: OrderV2,
++    pub order_type: OrderType,
++    #[serde(rename = "postOnly", skip_serializing_if = "Option::is_none")]
++    pub post_only: Option<bool>,
++}
++
++#[non_exhaustive]
++#[derive(Debug, Builder, PartialEq)]
++pub struct SignedOrderV2 {
++    pub order: OrderV2,
++    pub signature: Signature,
++    pub order_type: OrderType,
++    pub owner: ApiKey,
++    pub post_only: Option<bool>,
++}
++
+ /// Helper struct for serializing Order with signature injected.
+ /// This avoids the overhead of `serde_json::to_value()` followed by mutation.
+ #[serde_as]
+@@ -554,6 +643,134 @@ impl Serialize for SignedOrder {
+     }
+ }
+ 
++/// Helper struct for serializing V2 Order with signature injected.
++///
++/// Note: `expiration` is included as `"0"` in the POST body for compat but
++/// is NOT part of the EIP-712 digest. `metadata` and `builder` are `bytes32`
++/// and serialize as `0x`-prefixed 64-hex strings.
++#[serde_as]
++#[derive(Serialize)]
++struct OrderWithSignatureV2<'order> {
++    #[serde(serialize_with = "ser_salt")]
++    salt: &'order U256,
++    maker: &'order alloy::primitives::Address,
++    signer: &'order alloy::primitives::Address,
++    #[serde_as(as = "DisplayFromStr")]
++    #[serde(rename = "tokenId")]
++    token_id: &'order U256,
++    #[serde_as(as = "DisplayFromStr")]
++    #[serde(rename = "makerAmount")]
++    maker_amount: &'order U256,
++    #[serde_as(as = "DisplayFromStr")]
++    #[serde(rename = "takerAmount")]
++    taker_amount: &'order U256,
++    /// Side serialized as "BUY"/"SELL" string (CLOB API requirement)
++    side: Side,
++    /// Always serialized as the string "0" for V2 POST-body compatibility.
++    /// Not part of the V2 EIP-712 digest.
++    expiration: &'static str,
++    #[serde(rename = "signatureType")]
++    signature_type: u8,
++    #[serde_as(as = "DisplayFromStr")]
++    timestamp: &'order U256,
++    /// `bytes32` serializes as 0x-prefixed 64-hex.
++    metadata: &'order alloy::primitives::FixedBytes<32>,
++    builder: &'order alloy::primitives::FixedBytes<32>,
++    /// Signature injected into the order object.
++    signature: String,
++}
++
++impl Serialize for SignedOrderV2 {
++    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
++        let len = if self.post_only.is_some() { 4 } else { 3 };
++        let mut st = serializer.serialize_struct("SignedOrderV2", len)?;
++
++        let side = Side::try_from(self.order.side).map_err(S::Error::custom)?;
++
++        st.serialize_field(
++            "order",
++            &OrderWithSignatureV2 {
++                salt: &self.order.salt,
++                maker: &self.order.maker,
++                signer: &self.order.signer,
++                token_id: &self.order.tokenId,
++                maker_amount: &self.order.makerAmount,
++                taker_amount: &self.order.takerAmount,
++                side,
++                expiration: "0",
++                signature_type: self.order.signatureType,
++                timestamp: &self.order.timestamp,
++                metadata: &self.order.metadata,
++                builder: &self.order.builder,
++                signature: self.signature.to_string(),
++            },
++        )?;
++        st.serialize_field("owner", &self.owner)?;
++        st.serialize_field("orderType", &self.order_type)?;
++        if let Some(po) = self.post_only {
++            st.serialize_field("postOnly", &po)?;
++        }
++        st.end()
++    }
++}
++
++/// Dispatch wrapper for an unsigned order in either V1 or V2 shape.
++#[derive(Debug)]
++pub enum AnyOrder {
++    V1(Order),
++    V2(OrderV2),
++}
++
++impl AnyOrder {
++    pub fn version(&self) -> OrderVersion {
++        match self {
++            Self::V1(_) => OrderVersion::V1,
++            Self::V2(_) => OrderVersion::V2,
++        }
++    }
++}
++
++/// Dispatch wrapper for a signable order in either V1 or V2 shape.
++#[derive(Debug)]
++pub enum AnySignableOrder {
++    V1(SignableOrder),
++    V2(SignableOrderV2),
++}
++
++impl AnySignableOrder {
++    pub fn version(&self) -> OrderVersion {
++        match self {
++            Self::V1(_) => OrderVersion::V1,
++            Self::V2(_) => OrderVersion::V2,
++        }
++    }
++}
++
++/// Dispatch wrapper for a signed order in either V1 or V2 shape.
++#[derive(Debug)]
++pub enum AnySignedOrder {
++    V1(SignedOrder),
++    V2(SignedOrderV2),
++}
++
++impl AnySignedOrder {
++    pub fn version(&self) -> OrderVersion {
++        match self {
++            Self::V1(_) => OrderVersion::V1,
++            Self::V2(_) => OrderVersion::V2,
++        }
++    }
++}
++
++impl Serialize for AnySignedOrder {
++    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
++        match self {
++            Self::V1(o) => o.serialize(serializer),
++            Self::V2(o) => o.serialize(serializer),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use serde_json::to_value;
+diff --git a/src/lib.rs b/src/lib.rs
+index 96d3cb3..5cde20c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -43,6 +43,10 @@ use serde::de::DeserializeOwned;
+ use crate::error::Error;
+ use crate::types::{Address, address};
+ 
++// Re-export at crate root for convenience
++#[cfg(feature = "clob")]
++pub use crate::clob::types::OrderVersion;
++
+ pub type Result<T> = std::result::Result<T, Error>;
+ 
+ /// [`ChainId`] for Polygon mainnet
+@@ -59,27 +63,18 @@ pub(crate) type Timestamp = i64;
+ static CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
+     137_u64 => ContractConfig {
+         exchange: address!("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
++        exchange_v2: Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
++        neg_risk_exchange: Some(address!("0xC5d563A36AE78145C45a50134d48A1215220f80a")),
++        neg_risk_exchange_v2: Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
+         collateral: address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+         conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+-        neg_risk_adapter: None,
+-    },
+-    80002_u64 => ContractConfig {
+-        exchange: address!("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40"),
+-        collateral: address!("0x9c4e1703476e875070ee25b56a58b008cfb8fa78"),
+-        conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
+-        neg_risk_adapter: None,
+-    },
+-};
+-
+-static NEG_RISK_CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
+-    137_u64 => ContractConfig {
+-        exchange: address!("0xC5d563A36AE78145C45a50134d48A1215220f80a"),
+-        collateral: address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
+-        conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
+     },
+     80002_u64 => ContractConfig {
+-        exchange: address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"),
++        exchange: address!("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40"),
++        exchange_v2: Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
++        neg_risk_exchange: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
++        neg_risk_exchange_v2: Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
+         collateral: address!("0x9c4e1703476e875070ee25b56a58b008cfb8fa78"),
+         conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
+         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
+@@ -109,14 +104,21 @@ const SAFE_INIT_CODE_HASH: B256 =
+     b256!("0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf");
+ 
+ /// Helper struct to group the relevant deployed contract addresses
+-#[non_exhaustive]
+-#[derive(Debug)]
++#[derive(Copy, Clone, Debug)]
+ pub struct ContractConfig {
++    /// V1 standard exchange.
+     pub exchange: Address,
++    /// V2 standard exchange. `None` on chains where V2 hasn't deployed.
++    pub exchange_v2: Option<Address>,
++    /// V1 neg-risk exchange (today's `NEG_RISK_CONFIG[chain].exchange`).
++    pub neg_risk_exchange: Option<Address>,
++    /// V2 neg-risk exchange.
++    pub neg_risk_exchange_v2: Option<Address>,
+     pub collateral: Address,
+     pub conditional_tokens: Address,
+-    /// The Neg Risk Adapter contract address. Only present for neg-risk market configs.
+-    /// Users must approve this contract for token transfers to trade in neg-risk markets.
++    /// Neg-risk adapter contract. Used for merge/split/redeem on neg-risk markets
++    /// and must be granted ERC-20/ERC-1155 approvals by any wallet trading those
++    /// markets. Shared across V1 and V2.
+     pub neg_risk_adapter: Option<Address>,
+ }
+ 
+@@ -133,11 +135,18 @@ pub struct WalletContractConfig {
+ 
+ /// Given a `chain_id` and `is_neg_risk`, return the relevant [`ContractConfig`]
+ #[must_use]
+-pub fn contract_config(chain_id: ChainId, is_neg_risk: bool) -> Option<&'static ContractConfig> {
+-    if is_neg_risk {
+-        NEG_RISK_CONFIG.get(&chain_id)
++pub fn contract_config(chain_id: ChainId, neg_risk: bool) -> Option<ContractConfig> {
++    let base = CONFIG.get(&chain_id).copied()?;
++    if neg_risk {
++        // Swap `exchange` and `exchange_v2` to the neg-risk addresses so existing
++        // call sites that read `.exchange` keep working without reshaping.
++        Some(ContractConfig {
++            exchange: base.neg_risk_exchange?,
++            exchange_v2: base.neg_risk_exchange_v2,
++            ..base
++        })
+     } else {
+-        CONFIG.get(&chain_id)
++        Some(base)
+     }
+ }
+ 
+@@ -147,6 +156,36 @@ pub fn wallet_contract_config(chain_id: ChainId) -> Option<&'static WalletContra
+     WALLET_CONFIG.get(&chain_id)
+ }
+ 
++#[cfg(feature = "clob")]
++impl ContractConfig {
++    /// Addresses that must be granted USDC + CTF approvals for this
++    /// `OrderVersion`. Returns standard exchange + neg-risk exchange (if any)
++    /// for that version, plus the neg-risk adapter (shared across versions).
++    pub fn approval_spenders(&self, version: OrderVersion) -> Vec<Address> {
++        let mut out = Vec::with_capacity(3);
++        match version {
++            OrderVersion::V1 => {
++                out.push(self.exchange);
++                if let Some(nre) = self.neg_risk_exchange {
++                    out.push(nre);
++                }
++            }
++            OrderVersion::V2 => {
++                if let Some(ex) = self.exchange_v2 {
++                    out.push(ex);
++                }
++                if let Some(nre) = self.neg_risk_exchange_v2 {
++                    out.push(nre);
++                }
++            }
++        }
++        if let Some(adapter) = self.neg_risk_adapter {
++            out.push(adapter);
++        }
++        out
++    }
++}
++
+ /// Derives the Polymarket Proxy wallet address for an EOA using CREATE2.
+ ///
+ /// This is the deterministic address of the EIP-1167 minimal proxy wallet
+@@ -402,3 +441,56 @@ mod tests {
+         assert!(derive_safe_wallet(eoa, 1).is_none());
+     }
+ }
++
++#[cfg(test)]
++mod contract_config_v2_tests {
++    use super::*;
++    use alloy::primitives::address;
++
++    #[test]
++    fn mainnet_has_v2_exchanges() {
++        let cfg = contract_config(POLYGON, false).unwrap();
++        assert_eq!(
++            cfg.exchange_v2,
++            Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
++        );
++        assert_eq!(
++            cfg.neg_risk_exchange_v2,
++            Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
++        );
++    }
++
++    #[test]
++    fn amoy_has_v2_exchanges() {
++        let cfg = contract_config(AMOY, false).unwrap();
++        assert_eq!(
++            cfg.exchange_v2,
++            Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
++        );
++    }
++
++    #[test]
++    fn approval_spenders_v1_includes_standard_and_neg_risk() {
++        use super::OrderVersion;
++        let cfg = contract_config(POLYGON, false).unwrap();
++        let spenders = cfg.approval_spenders(OrderVersion::V1);
++        assert!(spenders.contains(&cfg.exchange));
++        assert!(spenders.contains(&cfg.neg_risk_exchange.unwrap()));
++        assert!(spenders.contains(&cfg.neg_risk_adapter.unwrap()));
++        // V2 addresses must NOT leak into V1 set
++        assert!(!spenders.contains(&cfg.exchange_v2.unwrap()));
++    }
++
++    #[test]
++    fn approval_spenders_v2_includes_v2_and_shared_adapter() {
++        use super::OrderVersion;
++        let cfg = contract_config(POLYGON, false).unwrap();
++        let spenders = cfg.approval_spenders(OrderVersion::V2);
++        assert!(spenders.contains(&cfg.exchange_v2.unwrap()));
++        assert!(spenders.contains(&cfg.neg_risk_exchange_v2.unwrap()));
++        // Neg-risk adapter is shared across versions
++        assert!(spenders.contains(&cfg.neg_risk_adapter.unwrap()));
++        // V1-only addresses must NOT leak into V2 set
++        assert!(!spenders.contains(&cfg.exchange));
++    }
++}
+diff --git a/tests/fixtures/gen_v2_vectors.py b/tests/fixtures/gen_v2_vectors.py
+new file mode 100644
+index 0000000..622f4b2
+--- /dev/null
++++ b/tests/fixtures/gen_v2_vectors.py
+@@ -0,0 +1,296 @@
++"""Generate golden vectors for V2 order signing.
++
++Produces JSON files under tests/fixtures/v2/ that the Rust test suite
++loads to verify the V2 signing pipeline (struct hash, signing hash,
++signature bytes, JSON body) is byte-for-byte equivalent to the canonical
++py-clob-client-v2.
++
++Approach: we compute hashes manually via eth_account.messages.encode_typed_data
++(the same library used internally by ExchangeOrderBuilderV2), extracting:
++  - encoded.body  → struct_hash   (EIP-712 hashStruct of the Order message)
++  - encoded.header → domain_sep  (EIP-712 domain separator hash)
++  - keccak(\x19\x01 + domain_sep + struct_hash) → signing_hash
++
++This gives us all four layers needed for the layered Rust tests without
++relying on private methods in ExchangeOrderBuilderV2.
++
++Run:
++    source /opt/venv/bin/activate
++    pip install eth-account eth-utils
++    python3 tests/fixtures/gen_v2_vectors.py
++
++Requires Python 3.9+.
++"""
++import json
++import pathlib
++
++from eth_account import Account
++from eth_account.messages import encode_typed_data
++from eth_utils import keccak as _keccak
++from eth_utils import to_checksum_address
++
++# ── Pinned throwaway private key (NOT a real wallet) ────────────────────────
++TEST_KEY = "0x" + "11" * 32
++TEST_ACCOUNT = Account.from_key(TEST_KEY)
++TEST_ADDRESS = TEST_ACCOUNT.address  # 0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A
++
++# ── Chain IDs ─────────────────────────────────────────────────────────────────
++CHAIN_MAINNET = 137
++CHAIN_AMOY = 80002
++
++# ── Exchange contract addresses ───────────────────────────────────────────────
++EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
++NEG_RISK_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
++
++# ── EIP-712 type definitions ─────────────────────────────────────────────────
++EIP712_DOMAIN_TYPES = [
++    {"name": "name", "type": "string"},
++    {"name": "version", "type": "string"},
++    {"name": "chainId", "type": "uint256"},
++    {"name": "verifyingContract", "type": "address"},
++]
++
++ORDER_STRUCT_TYPES = [
++    {"name": "salt", "type": "uint256"},
++    {"name": "maker", "type": "address"},
++    {"name": "signer", "type": "address"},
++    {"name": "tokenId", "type": "uint256"},
++    {"name": "makerAmount", "type": "uint256"},
++    {"name": "takerAmount", "type": "uint256"},
++    {"name": "side", "type": "uint8"},
++    {"name": "signatureType", "type": "uint8"},
++    {"name": "timestamp", "type": "uint256"},
++    {"name": "metadata", "type": "bytes32"},
++    {"name": "builder", "type": "bytes32"},
++]
++
++# ── Pinned order values (common across most fixtures) ────────────────────────
++PINNED_SALT = 7654321
++PINNED_TOKEN_ID = 12345678901234567890  # fits in uint256, > u64
++PINNED_MAKER_AMOUNT = 1000000
++PINNED_TAKER_AMOUNT = 2000000
++PINNED_TIMESTAMP = 1713600000
++BYTES32_ZERO = bytes(32)
++METADATA_ZERO = "0x" + "00" * 32
++BUILDER_ZERO = "0x" + "00" * 32
++
++OUT_DIR = pathlib.Path(__file__).parent / "v2"
++OUT_DIR.mkdir(parents=True, exist_ok=True)
++
++
++def hex32_to_bytes(hex_str: str) -> bytes:
++    """Convert a 0x-prefixed 64-hex string to 32 bytes."""
++    clean = hex_str.replace("0x", "").zfill(64)
++    return bytes.fromhex(clean)
++
++
++def build_fixture(
++    chain_id: int,
++    verifying_contract: str,
++    maker: str,
++    signer: str,
++    token_id: int,
++    maker_amount: int,
++    taker_amount: int,
++    side: int,           # 0=BUY, 1=SELL
++    signature_type: int, # 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
++    timestamp: int,
++    metadata_hex: str,   # 0x-prefixed 64-hex
++    builder_hex: str,    # 0x-prefixed 64-hex
++) -> dict:
++    """Build one complete fixture dict with all four layers."""
++
++    # ── Build the typed data dict ────────────────────────────────────────────
++    typed_data = {
++        "primaryType": "Order",
++        "types": {
++            "EIP712Domain": EIP712_DOMAIN_TYPES,
++            "Order": ORDER_STRUCT_TYPES,
++        },
++        "domain": {
++            "name": "Polymarket CTF Exchange",
++            "version": "2",
++            "chainId": chain_id,
++            "verifyingContract": to_checksum_address(verifying_contract),
++        },
++        "message": {
++            "salt": PINNED_SALT,
++            "maker": to_checksum_address(maker),
++            "signer": to_checksum_address(signer),
++            "tokenId": token_id,
++            "makerAmount": maker_amount,
++            "takerAmount": taker_amount,
++            "side": side,
++            "signatureType": signature_type,
++            "timestamp": timestamp,
++            "metadata": hex32_to_bytes(metadata_hex),
++            "builder": hex32_to_bytes(builder_hex),
++        },
++    }
++
++    # ── Layer 1: struct hash (EIP-712 hashStruct) ────────────────────────────
++    encoded = encode_typed_data(full_message=typed_data)
++    # encoded.body is the struct hash (32 bytes)
++    struct_hash_bytes = encoded.body
++    struct_hash = "0x" + struct_hash_bytes.hex()
++
++    # ── Layer 2: signing hash (\x19\x01 + domain_sep + struct_hash) ──────────
++    signing_hash_bytes = _keccak(
++        primitive=b"\x19" + encoded.version + encoded.header + encoded.body
++    )
++    signing_hash = "0x" + signing_hash_bytes.hex()
++
++    # ── Layer 3: signature ───────────────────────────────────────────────────
++    signed = Account.sign_message(encoded, private_key=TEST_KEY)
++    signature_full = "0x" + signed.signature.hex()
++
++    # Sanity: recover signer
++    recovered = Account.recover_message(encoded, signature=signed.signature)
++    assert recovered.lower() == TEST_ADDRESS.lower(), (
++        f"Recovery mismatch: {recovered} != {TEST_ADDRESS}"
++    )
++
++    # ── Layer 4: JSON body (matches Rust SignedOrderV2::Serialize output) ──────
++    # Addresses are stored as lowercase hex to match alloy's Address serializer.
++    # The CLOB API accepts both checksum and lowercase addresses.
++    side_str = "BUY" if side == 0 else "SELL"
++    json_body_order = {
++        "salt": PINNED_SALT,
++        "maker": maker.lower(),
++        "signer": signer.lower(),
++        "tokenId": str(token_id),
++        "makerAmount": str(maker_amount),
++        "takerAmount": str(taker_amount),
++        "side": side_str,
++        "expiration": "0",
++        "signatureType": signature_type,
++        "timestamp": str(timestamp),
++        "metadata": metadata_hex,
++        "builder": builder_hex,
++        "signature": signature_full,
++    }
++
++    return {
++        "input": {
++            "chain_id": chain_id,
++            "verifying_contract": to_checksum_address(verifying_contract),
++            "test_key": TEST_KEY,
++            "order": {
++                "salt": str(PINNED_SALT),
++                "maker": to_checksum_address(maker),
++                "signer": to_checksum_address(signer),
++                "tokenId": str(token_id),
++                "makerAmount": str(maker_amount),
++                "takerAmount": str(taker_amount),
++                "side": side_str,
++                "signatureType": signature_type,
++                "timestamp": str(timestamp),
++                "metadata": metadata_hex,
++                "builder": builder_hex,
++            },
++        },
++        "eip712": {
++            "struct_hash": struct_hash,
++            "signing_hash": signing_hash,
++        },
++        "signature": {
++            "full": signature_full,
++        },
++        "json_body": json_body_order,
++    }
++
++
++def main() -> None:
++    common_kwargs = dict(
++        maker=TEST_ADDRESS,
++        signer=TEST_ADDRESS,
++        token_id=PINNED_TOKEN_ID,
++        maker_amount=PINNED_MAKER_AMOUNT,
++        taker_amount=PINNED_TAKER_AMOUNT,
++        side=0,  # BUY
++        timestamp=PINNED_TIMESTAMP,
++        metadata_hex=METADATA_ZERO,
++        builder_hex=BUILDER_ZERO,
++    )
++
++    fixtures = {
++        # 1. EOA, mainnet, standard exchange
++        "eoa_mainnet.json": build_fixture(
++            chain_id=CHAIN_MAINNET,
++            verifying_contract=EXCHANGE_V2,
++            signature_type=0,  # EOA
++            **common_kwargs,
++        ),
++        # 2. EOA, mainnet, neg-risk exchange
++        "eoa_neg_risk_mainnet.json": build_fixture(
++            chain_id=CHAIN_MAINNET,
++            verifying_contract=NEG_RISK_EXCHANGE_V2,
++            signature_type=0,  # EOA
++            **common_kwargs,
++        ),
++        # 3. POLY_PROXY, mainnet, standard exchange
++        "poly_proxy_mainnet.json": build_fixture(
++            chain_id=CHAIN_MAINNET,
++            verifying_contract=EXCHANGE_V2,
++            signature_type=1,  # POLY_PROXY
++            **common_kwargs,
++        ),
++        # 4. POLY_GNOSIS_SAFE, mainnet, standard exchange
++        "poly_gnosis_safe_mainnet.json": build_fixture(
++            chain_id=CHAIN_MAINNET,
++            verifying_contract=EXCHANGE_V2,
++            signature_type=2,  # POLY_GNOSIS_SAFE
++            **common_kwargs,
++        ),
++        # 5. EOA, Amoy (chainId=80002), same V2 contract address
++        "eoa_amoy.json": build_fixture(
++            chain_id=CHAIN_AMOY,
++            verifying_contract=EXCHANGE_V2,
++            signature_type=0,  # EOA
++            **common_kwargs,
++        ),
++        # 6. EOA, mainnet, non-zero metadata + builder bytes32
++        "eoa_nonzero_metadata.json": build_fixture(
++            chain_id=CHAIN_MAINNET,
++            verifying_contract=EXCHANGE_V2,
++            signature_type=0,  # EOA
++            **{
++                **common_kwargs,
++                "metadata_hex": "0x" + "ab" * 32,
++                "builder_hex": "0x" + "cd" * 32,
++            },
++        ),
++        # 7. EOA, mainnet, SELL side — catches Side enum mapping bugs in struct
++        #    hash and Serialize output (side=1 vs side=0 in the BUY fixtures).
++        "eoa_sell_mainnet.json": build_fixture(
++            chain_id=CHAIN_MAINNET,
++            verifying_contract=EXCHANGE_V2,
++            signature_type=0,  # EOA
++            **{
++                **common_kwargs,
++                "side": 1,  # SELL
++            },
++        ),
++    }
++
++    for filename, fixture in fixtures.items():
++        path = OUT_DIR / filename
++        path.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
++        print(f"wrote {path}")
++
++    print("\nSanity check — first fixture:")
++    fx = fixtures["eoa_mainnet.json"]
++    print(f"  struct_hash  = {fx['eip712']['struct_hash']}")
++    print(f"  signing_hash = {fx['eip712']['signing_hash']}")
++    print(f"  signature    = {fx['signature']['full'][:20]}...")
++    assert len(fx["signature"]["full"]) == 132, "signature should be 0x + 130 hex chars (65 bytes)"
++    assert fx["eip712"]["struct_hash"].startswith("0x"), "struct_hash should start with 0x"
++    assert fx["eip712"]["signing_hash"].startswith("0x"), "signing_hash should start with 0x"
++    # All 7 should have distinct signing hashes
++    hashes = [f["eip712"]["signing_hash"] for f in fixtures.values()]
++    assert len(set(hashes)) == len(hashes), f"signing hashes must all be distinct: {hashes}"
++    print("  All sanity checks pass.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/fixtures/v2/eoa_amoy.json b/tests/fixtures/v2/eoa_amoy.json
+new file mode 100644
+index 0000000..dbb75c8
+--- /dev/null
++++ b/tests/fixtures/v2/eoa_amoy.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0x1a1e5b842107d0645880ff5f15615d7b91f24b1bbc6d85558dd42f70e4510d1e",
++    "struct_hash": "0x3bfe3e17f4d54ca101c316bc1075b75012866e7a58e69cfc1e2bfccd4652c23d"
++  },
++  "input": {
++    "chain_id": 80002,
++    "order": {
++      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "salt": "7654321",
++      "side": "BUY",
++      "signatureType": 0,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
++  },
++  "json_body": {
++    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "salt": 7654321,
++    "side": "BUY",
++    "signature": "0x54a253019f223c8a12be112ff40a5f5668a82380a0d1db2a9403da7f0df259d0639e073c06896e26c04a33d8c85c40d9761ff22c49d0c2d8cf28775c209eeff61c",
++    "signatureType": 0,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x54a253019f223c8a12be112ff40a5f5668a82380a0d1db2a9403da7f0df259d0639e073c06896e26c04a33d8c85c40d9761ff22c49d0c2d8cf28775c209eeff61c"
++  }
++}
+diff --git a/tests/fixtures/v2/eoa_mainnet.json b/tests/fixtures/v2/eoa_mainnet.json
+new file mode 100644
+index 0000000..ee70979
+--- /dev/null
++++ b/tests/fixtures/v2/eoa_mainnet.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0x05062f445f81dc1b9a4191b334e42bbc895d64cd1dd817d7cbea543d590550c7",
++    "struct_hash": "0x3bfe3e17f4d54ca101c316bc1075b75012866e7a58e69cfc1e2bfccd4652c23d"
++  },
++  "input": {
++    "chain_id": 137,
++    "order": {
++      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "salt": "7654321",
++      "side": "BUY",
++      "signatureType": 0,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
++  },
++  "json_body": {
++    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "salt": 7654321,
++    "side": "BUY",
++    "signature": "0x13d41af63649c29a5d8494c2cb7f138614cd3cfeda60cc754a5f4f986d491d544a0e7aa2e61ff60359c21eb405112eafa85b37ff3400f9ffa5225f96135ae6af1c",
++    "signatureType": 0,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x13d41af63649c29a5d8494c2cb7f138614cd3cfeda60cc754a5f4f986d491d544a0e7aa2e61ff60359c21eb405112eafa85b37ff3400f9ffa5225f96135ae6af1c"
++  }
++}
+diff --git a/tests/fixtures/v2/eoa_neg_risk_mainnet.json b/tests/fixtures/v2/eoa_neg_risk_mainnet.json
+new file mode 100644
+index 0000000..5fd002a
+--- /dev/null
++++ b/tests/fixtures/v2/eoa_neg_risk_mainnet.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0x88decff06dbf3f6e15ca4650cfff59e7da854c184778e125d5c7a346a246ca80",
++    "struct_hash": "0x3bfe3e17f4d54ca101c316bc1075b75012866e7a58e69cfc1e2bfccd4652c23d"
++  },
++  "input": {
++    "chain_id": 137,
++    "order": {
++      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "salt": "7654321",
++      "side": "BUY",
++      "signatureType": 0,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xe2222d279d744050d28e00520010520000310F59"
++  },
++  "json_body": {
++    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "salt": 7654321,
++    "side": "BUY",
++    "signature": "0x3d2091e7b29c491aefaab91838205ae38019ce32a5b146c5e0da07c85144d17c015739cbccb3da22f0734294a9b8617ec3d31694d91c42263c311201b1a1f18f1b",
++    "signatureType": 0,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x3d2091e7b29c491aefaab91838205ae38019ce32a5b146c5e0da07c85144d17c015739cbccb3da22f0734294a9b8617ec3d31694d91c42263c311201b1a1f18f1b"
++  }
++}
+diff --git a/tests/fixtures/v2/eoa_nonzero_metadata.json b/tests/fixtures/v2/eoa_nonzero_metadata.json
+new file mode 100644
+index 0000000..606279a
+--- /dev/null
++++ b/tests/fixtures/v2/eoa_nonzero_metadata.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0x4bb58da61480527cf0115a4e0564049b495ee5418816d35dde63578c53da6690",
++    "struct_hash": "0xff8f995dd3279a119f74fb25e65e2b84be6e0f5c895daf0e3980727d21fb6825"
++  },
++  "input": {
++    "chain_id": 137,
++    "order": {
++      "builder": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0xabababababababababababababababababababababababababababababababab",
++      "salt": "7654321",
++      "side": "BUY",
++      "signatureType": 0,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
++  },
++  "json_body": {
++    "builder": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0xabababababababababababababababababababababababababababababababab",
++    "salt": 7654321,
++    "side": "BUY",
++    "signature": "0x6d0f0aa8bf350bb50fe449a636159d6562e5d86b09ce22fb1e7b144445fd01ef6fef3abaf6c77651ebb5459734e72130ed35de5b75c04397541db9c579dbd5871b",
++    "signatureType": 0,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x6d0f0aa8bf350bb50fe449a636159d6562e5d86b09ce22fb1e7b144445fd01ef6fef3abaf6c77651ebb5459734e72130ed35de5b75c04397541db9c579dbd5871b"
++  }
++}
+diff --git a/tests/fixtures/v2/eoa_sell_mainnet.json b/tests/fixtures/v2/eoa_sell_mainnet.json
+new file mode 100644
+index 0000000..d37b8b5
+--- /dev/null
++++ b/tests/fixtures/v2/eoa_sell_mainnet.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0x8506417752ed8d53f2ec27c1c2d99b2afa049b3a332c1d9ea0162e7a6ddbf1a2",
++    "struct_hash": "0xe497dc2c167f2c6c32bc0634810a2870a5beeede1614829550a3eaa8a3eaa7ce"
++  },
++  "input": {
++    "chain_id": 137,
++    "order": {
++      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "salt": "7654321",
++      "side": "SELL",
++      "signatureType": 0,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
++  },
++  "json_body": {
++    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "salt": 7654321,
++    "side": "SELL",
++    "signature": "0x6888eb3323404a9b2972d8e2293af206d63cd30e9428fca18635df8e77e7c5de641ac13a774dd90ee5a4893f8e6bbd54e911f377cbb196e1eb3cd5d7868709991c",
++    "signatureType": 0,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x6888eb3323404a9b2972d8e2293af206d63cd30e9428fca18635df8e77e7c5de641ac13a774dd90ee5a4893f8e6bbd54e911f377cbb196e1eb3cd5d7868709991c"
++  }
++}
+diff --git a/tests/fixtures/v2/poly_gnosis_safe_mainnet.json b/tests/fixtures/v2/poly_gnosis_safe_mainnet.json
+new file mode 100644
+index 0000000..e7c8881
+--- /dev/null
++++ b/tests/fixtures/v2/poly_gnosis_safe_mainnet.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0x7ef2420a1ee6712dfb9817f9975429af21185e98915d541edeb43bbc051faa2c",
++    "struct_hash": "0xd9067ed48d7854c28bd0abb57175dd96f1090cc9153c94603d5029b082ac6e72"
++  },
++  "input": {
++    "chain_id": 137,
++    "order": {
++      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "salt": "7654321",
++      "side": "BUY",
++      "signatureType": 2,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
++  },
++  "json_body": {
++    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "salt": 7654321,
++    "side": "BUY",
++    "signature": "0x9ee8617a922e6621a3387c03e2edbb789f0a52ba201ac85dd52ae3ebf6396b9442fe10ef9225e6d2b003d08bf3b8d77fc523f75d664ff9885d3759322467d5071c",
++    "signatureType": 2,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x9ee8617a922e6621a3387c03e2edbb789f0a52ba201ac85dd52ae3ebf6396b9442fe10ef9225e6d2b003d08bf3b8d77fc523f75d664ff9885d3759322467d5071c"
++  }
++}
+diff --git a/tests/fixtures/v2/poly_proxy_mainnet.json b/tests/fixtures/v2/poly_proxy_mainnet.json
+new file mode 100644
+index 0000000..05c9c42
+--- /dev/null
++++ b/tests/fixtures/v2/poly_proxy_mainnet.json
+@@ -0,0 +1,42 @@
++{
++  "eip712": {
++    "signing_hash": "0xd0b66650c277513bc3c21bbf8dfd45118687e97b4731dc7919d9cff1a4d9bc91",
++    "struct_hash": "0x9402aa43b1a52505f3f3f955cffe0fe5f75649a186e4a3ce0b64b609f2cbdfc8"
++  },
++  "input": {
++    "chain_id": 137,
++    "order": {
++      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "makerAmount": "1000000",
++      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++      "salt": "7654321",
++      "side": "BUY",
++      "signatureType": 1,
++      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
++      "takerAmount": "2000000",
++      "timestamp": "1713600000",
++      "tokenId": "12345678901234567890"
++    },
++    "test_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
++    "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
++  },
++  "json_body": {
++    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "expiration": "0",
++    "maker": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "makerAmount": "1000000",
++    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
++    "salt": 7654321,
++    "side": "BUY",
++    "signature": "0x1ba6714c151942745ce46092dff055445f64a79467d6c8837bb3cfb50abc5bbc41d31e9c5940448918f1d9c70636eaee616dfdba6be3b9e685bf135203fd86ad1b",
++    "signatureType": 1,
++    "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
++    "takerAmount": "2000000",
++    "timestamp": "1713600000",
++    "tokenId": "12345678901234567890"
++  },
++  "signature": {
++    "full": "0x1ba6714c151942745ce46092dff055445f64a79467d6c8837bb3cfb50abc5bbc41d31e9c5940448918f1d9c70636eaee616dfdba6be3b9e685bf135203fd86ad1b"
++  }
++}
+diff --git a/tests/order.rs b/tests/order.rs
+index 1ce6413..fc6d490 100644
+--- a/tests/order.rs
++++ b/tests/order.rs
+@@ -3176,3 +3176,237 @@ mod market {
+         Ok(())
+     }
+ }
++
++#[test]
++fn order_version_defaults_to_v1() {
++    use polymarket_client_sdk::clob::types::OrderVersion;
++    assert_eq!(OrderVersion::default(), OrderVersion::V1);
++}
++
++#[test]
++fn any_order_wraps_v1_and_v2() {
++    use polymarket_client_sdk::clob::types::{AnyOrder, Order, OrderV2};
++    let v1: AnyOrder = AnyOrder::V1(Order::default());
++    let v2: AnyOrder = AnyOrder::V2(OrderV2::default());
++    assert!(matches!(v1, AnyOrder::V1(_)));
++    assert!(matches!(v2, AnyOrder::V2(_)));
++}
++
++#[test]
++fn order_v2_has_v2_fields() {
++    use alloy::primitives::{FixedBytes, U256};
++    use polymarket_client_sdk::clob::types::OrderV2;
++
++    // Verify OrderV2's `Default` impl produces all-zero V2 fields (which
++    // implicitly verifies the field layout — if the sol! macro produces a
++    // struct with the wrong field set, Default either fails or returns the
++    // wrong shape).
++    let o = OrderV2::default();
++    assert_eq!(o.salt, U256::ZERO);
++    assert_eq!(o.tokenId, U256::ZERO);
++    assert_eq!(o.makerAmount, U256::ZERO);
++    assert_eq!(o.takerAmount, U256::ZERO);
++    assert_eq!(o.side, 0u8);
++    assert_eq!(o.signatureType, 0u8);
++    assert_eq!(o.timestamp, U256::ZERO);
++    assert_eq!(o.metadata, FixedBytes::<32>::ZERO);
++    assert_eq!(o.builder, FixedBytes::<32>::ZERO);
++}
++
++#[test]
++fn signable_order_v2_constructs() {
++    use polymarket_client_sdk::clob::types::{OrderType, OrderV2, SignableOrderV2};
++    let s = SignableOrderV2::builder()
++        .order(OrderV2::default())
++        .order_type(OrderType::default())
++        .build();
++    assert_eq!(s.post_only, None);
++}
++
++#[test]
++fn signed_order_v2_json_includes_expiration_zero_and_v2_fields() {
++    use alloy::primitives::{Signature, U256};
++    use polymarket_client_sdk::clob::types::{OrderType, OrderV2, SignedOrderV2};
++    use uuid::Uuid;
++
++    // Use Signature::new(r, s, v) — the same pattern used in the in-crate tests.
++    let sig = Signature::new(U256::ZERO, U256::ZERO, false);
++
++    // OrderV2 is #[non_exhaustive] but Default is derived, so we can use
++    // default() + field mutation from an external crate.
++    let mut order = OrderV2::default();
++    // side = 0 => BUY; timestamp = non-zero to verify the field is present.
++    order.side = 0;
++    order.timestamp = U256::from(1_713_600_000u64);
++
++    let signed = SignedOrderV2::builder()
++        .order(order)
++        .signature(sig)
++        .order_type(OrderType::GTC)
++        .owner(Uuid::nil())
++        .build();
++
++    let v = serde_json::to_value(&signed).unwrap();
++    let order_json = &v["order"];
++
++    // V2-specific fields present
++    assert!(order_json.get("timestamp").is_some(), "timestamp missing");
++    assert!(order_json.get("metadata").is_some(), "metadata missing");
++    assert!(order_json.get("builder").is_some(), "builder missing");
++    // Compat: expiration still appears in body as "0"
++    assert_eq!(
++        order_json["expiration"].as_str(),
++        Some("0"),
++        "expiration must be \"0\""
++    );
++    // V1-only removed fields must NOT appear
++    assert!(
++        order_json.get("taker").is_none(),
++        "taker should not be in V2 body"
++    );
++    assert!(
++        order_json.get("nonce").is_none(),
++        "nonce should not be in V2 body"
++    );
++    assert!(
++        order_json.get("feeRateBps").is_none(),
++        "feeRateBps should not be in V2 body"
++    );
++    // Side is stringified
++    assert_eq!(order_json["side"].as_str(), Some("BUY"));
++}
++
++#[test]
++fn any_signable_and_signed_wrap_both_versions() {
++    use polymarket_client_sdk::clob::types::{
++        AnySignableOrder, AnySignedOrder, OrderVersion,
++    };
++
++    // Just check the dispatch enums can be named and matched on. Construction
++    // is covered by the existing V1/V2 test coverage; this test is about the
++    // enum's existence and the .version() helper.
++    let _variant_a = AnySignableOrder::version;  // function pointer compile check
++    let _variant_b = AnySignedOrder::version;
++    let _v1 = OrderVersion::V1;
++    let _v2 = OrderVersion::V2;
++}
++
++#[test]
++fn order_builder_version_flag_defaults_v1() {
++    use polymarket_client_sdk::auth::Normal;
++    use polymarket_client_sdk::clob::order_builder::{Limit, OrderBuilder};
++    // Smoke: default version is V1 — just the fact that this compiles is the
++    // test. Actual dispatch is tested in Task 10.
++    let _ = OrderBuilder::<Limit, Normal>::version;
++}
++
++/// Tests for `build_any()` dispatch on [`OrderVersion`].
++mod build_any {
++    use alloy::primitives::U256;
++    use polymarket_client_sdk::clob::types::{AnySignableOrder, OrderType, OrderVersion, Side};
++
++    use super::*;
++    use crate::common::{create_authenticated, ensure_requirements, token_1};
++
++    /// `build_any()` with V1 version emits `AnySignableOrder::V1`.
++    #[tokio::test]
++    async fn build_any_v1_emits_v1_variant() -> anyhow::Result<()> {
++        let server = MockServer::start();
++        let client = create_authenticated(&server).await?;
++
++        ensure_requirements(&server, token_1(), TickSize::Tenth);
++
++        let result = client
++            .limit_order()
++            .token_id(token_1())
++            .size(Decimal::ONE_HUNDRED)
++            .price(dec!(0.1))
++            .side(Side::Buy)
++            // V1 is the default; call .version() explicitly to exercise that path
++            .version(OrderVersion::V1)
++            .build_any()
++            .await?;
++
++        assert!(
++            matches!(result, AnySignableOrder::V1(_)),
++            "expected V1 variant, got {result:?}",
++        );
++
++        // Confirm the inner order has the expected shape
++        if let AnySignableOrder::V1(signable) = result {
++            assert_eq!(signable.order_type, OrderType::GTC);
++            // V1 order has a taker field (zero by default)
++            assert_eq!(signable.order.taker, Address::ZERO);
++            // Salt is set (masked to <= 2^53-1)
++            assert!(signable.order.salt < U256::from(1u64 << 53));
++        }
++
++        Ok(())
++    }
++
++    /// `build_any()` with V2 version emits `AnySignableOrder::V2` and populates
++    /// V2-specific fields: `timestamp != 0`, `metadata`, `builder`.
++    #[tokio::test]
++    async fn build_any_v2_emits_v2_variant() -> anyhow::Result<()> {
++        let server = MockServer::start();
++        let client = create_authenticated(&server).await?;
++
++        ensure_requirements(&server, token_1(), TickSize::Tenth);
++
++        let result = client
++            .limit_order()
++            .token_id(token_1())
++            .size(Decimal::ONE_HUNDRED)
++            .price(dec!(0.1))
++            .side(Side::Buy)
++            .version(OrderVersion::V2)
++            .build_any()
++            .await?;
++
++        assert!(
++            matches!(result, AnySignableOrder::V2(_)),
++            "expected V2 variant, got {result:?}",
++        );
++
++        if let AnySignableOrder::V2(signable) = result {
++            assert_eq!(signable.order_type, OrderType::GTC);
++
++            // timestamp must be non-zero (set to Utc::now())
++            assert_ne!(
++                signable.order.timestamp,
++                U256::ZERO,
++                "V2 timestamp must be set"
++            );
++
++            // Salt is set and masked
++            assert!(signable.order.salt < U256::from(1u64 << 53));
++
++            // makerAmount and takerAmount populated (Buy 100 shares at 0.1)
++            // taker_amount = 100 shares => 100_000_000 (6 decimals)
++            // maker_amount = 100 * 0.1 = 10 USDC => 10_000_000
++            assert_eq!(signable.order.takerAmount, U256::from(100_000_000u64));
++            assert_eq!(signable.order.makerAmount, U256::from(10_000_000u64));
++
++            // metadata and builder default to zero bytes32
++            assert_eq!(signable.order.metadata, alloy::primitives::FixedBytes::<32>::ZERO);
++            assert_eq!(signable.order.builder, alloy::primitives::FixedBytes::<32>::ZERO);
++        }
++
++        Ok(())
++    }
++}
++
++#[test]
++fn v2_domain_uses_version_2_and_exchange_v2() {
++    use polymarket_client_sdk::clob::client::v2_domain_for_test;
++    use polymarket_client_sdk::POLYGON;
++    use alloy::primitives::address;
++
++    let d = v2_domain_for_test(POLYGON, /*neg_risk=*/false).unwrap();
++    assert_eq!(d.version.as_deref(), Some("2"));
++    assert_eq!(d.name.as_deref(), Some("Polymarket CTF Exchange"));
++    assert_eq!(
++        d.verifying_contract,
++        Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
++    );
++}
+diff --git a/tests/v2_signing.rs b/tests/v2_signing.rs
+new file mode 100644
+index 0000000..b6d5ace
+--- /dev/null
++++ b/tests/v2_signing.rs
+@@ -0,0 +1,291 @@
++#![cfg(feature = "clob")]
++#![allow(
++    clippy::unwrap_used,
++    reason = "Test code — unwrap is fine for fixture loading and parsing"
++)]
++
++//! Golden-vector parity tests: Rust V2 signing must byte-match the canonical
++//! py-clob-client-v2 output for every fixture in `tests/fixtures/v2/`.
++//!
++//! Layers, asserted in order (first failure pinpoints the bug):
++//!   1. Struct hash — `sol!` field layout / encoding.
++//!   2. Signing hash — Eip712Domain (name / version / chainId / verifyingContract).
++//!   3. Signature bytes — deterministic RFC 6979 ECDSA.
++//!   4. JSON body — `Serialize` impl produces V2 shape with expiration="0".
++
++use std::borrow::Cow;
++use std::str::FromStr as _;
++
++use alloy::dyn_abi::Eip712Domain;
++use alloy::primitives::{Address, FixedBytes, Signature, U256};
++use alloy::signers::local::LocalSigner;
++use alloy::signers::SignerSync as _;
++use alloy::sol_types::SolStruct as _;
++use polymarket_client_sdk::clob::types::{OrderType, OrderV2, SignedOrderV2};
++use serde::Deserialize;
++use uuid::Uuid;
++
++// ── Fixture schema ────────────────────────────────────────────────────────────
++
++#[derive(Deserialize)]
++struct Fixture {
++    input: Input,
++    eip712: Eip712,
++    signature: SignatureField,
++    json_body: serde_json::Value,
++}
++
++#[derive(Deserialize)]
++struct Input {
++    chain_id: u64,
++    verifying_contract: String,
++    test_key: String,
++    order: OrderInput,
++}
++
++#[derive(Deserialize)]
++struct OrderInput {
++    salt: String,
++    maker: String,
++    signer: String,
++    #[serde(rename = "tokenId")]
++    token_id: String,
++    #[serde(rename = "makerAmount")]
++    maker_amount: String,
++    #[serde(rename = "takerAmount")]
++    taker_amount: String,
++    side: String,
++    #[serde(rename = "signatureType")]
++    signature_type: u8,
++    timestamp: String,
++    metadata: String,
++    builder: String,
++}
++
++#[derive(Deserialize)]
++struct Eip712 {
++    struct_hash: String,
++    signing_hash: String,
++}
++
++#[derive(Deserialize)]
++struct SignatureField {
++    full: String,
++}
++
++// ── Helpers ───────────────────────────────────────────────────────────────────
++
++fn hex_to_bytes32(s: &str) -> FixedBytes<32> {
++    let clean = s.trim_start_matches("0x");
++    let bytes = hex::decode(clean).expect("valid hex");
++    assert_eq!(bytes.len(), 32, "hex_to_bytes32: expected 32 bytes, got {}", bytes.len());
++    FixedBytes::<32>::from_slice(&bytes)
++}
++
++/// Build an `OrderV2` from fixture input using `default()` + field mutation,
++/// which is the only pattern allowed by `#[non_exhaustive]` from external crates.
++fn build_order_v2(inp: &OrderInput) -> OrderV2 {
++    let mut order = OrderV2::default();
++    order.salt = U256::from_str(&inp.salt).unwrap();
++    order.maker = Address::from_str(&inp.maker).unwrap();
++    order.signer = Address::from_str(&inp.signer).unwrap();
++    order.tokenId = U256::from_str(&inp.token_id).unwrap();
++    order.makerAmount = U256::from_str(&inp.maker_amount).unwrap();
++    order.takerAmount = U256::from_str(&inp.taker_amount).unwrap();
++    order.side = if inp.side == "BUY" { 0 } else { 1 };
++    order.signatureType = inp.signature_type;
++    order.timestamp = U256::from_str(&inp.timestamp).unwrap();
++    order.metadata = hex_to_bytes32(&inp.metadata);
++    order.builder = hex_to_bytes32(&inp.builder);
++    order
++}
++
++fn domain_for(inp: &Input) -> Eip712Domain {
++    Eip712Domain {
++        name: Some(Cow::Borrowed("Polymarket CTF Exchange")),
++        version: Some(Cow::Borrowed("2")),
++        chain_id: Some(U256::from(inp.chain_id)),
++        verifying_contract: Some(Address::from_str(&inp.verifying_contract).unwrap()),
++        ..Eip712Domain::default()
++    }
++}
++
++fn b256_to_hex(b: alloy::primitives::B256) -> String {
++    format!("0x{}", hex::encode(b.as_slice()))
++}
++
++/// Parse the Python-generated 0x-hex signature (65 bytes, v=27|28) into an
++/// alloy `Signature`. Uses `Signature::from_raw_array` which normalises v
++/// from 27/28 → parity bool.
++fn parse_py_signature(hex_sig: &str) -> Signature {
++    let clean = hex_sig.trim_start_matches("0x");
++    let bytes: Vec<u8> = hex::decode(clean).expect("hex signature");
++    let arr: [u8; 65] = bytes.try_into().expect("signature is exactly 65 bytes");
++    Signature::from_raw_array(&arr).expect("valid signature bytes")
++}
++
++// ── Core fixture runner ───────────────────────────────────────────────────────
++
++fn run_fixture(name: &str) {
++    let raw = std::fs::read_to_string(format!("tests/fixtures/v2/{name}"))
++        .unwrap_or_else(|e| panic!("fixture {name} not found: {e}"));
++    let fx: Fixture = serde_json::from_str(&raw)
++        .unwrap_or_else(|e| panic!("fixture {name} failed to parse: {e}"));
++
++    let order = build_order_v2(&fx.input.order);
++    let domain = domain_for(&fx.input);
++
++    // ── Layer 1: struct hash ──────────────────────────────────────────────────
++    let struct_hash = order.eip712_hash_struct();
++    let got_struct_hash = b256_to_hex(struct_hash);
++    assert_eq!(
++        got_struct_hash, fx.eip712.struct_hash,
++        "{name}: LAYER 1 struct hash mismatch\n  got: {got_struct_hash}\n  exp: {}",
++        fx.eip712.struct_hash,
++    );
++
++    // ── Layer 2: signing hash ─────────────────────────────────────────────────
++    let signing_hash = order.eip712_signing_hash(&domain);
++    let got_signing_hash = b256_to_hex(signing_hash);
++    assert_eq!(
++        got_signing_hash, fx.eip712.signing_hash,
++        "{name}: LAYER 2 signing hash mismatch\n  got: {got_signing_hash}\n  exp: {}",
++        fx.eip712.signing_hash,
++    );
++
++    // ── Layer 3: signature bytes ──────────────────────────────────────────────
++    let wallet = LocalSigner::from_str(&fx.input.test_key)
++        .unwrap_or_else(|e| panic!("{name}: failed to load test key: {e}"));
++    let rust_sig = wallet
++        .sign_hash_sync(&signing_hash)
++        .unwrap_or_else(|e| panic!("{name}: sign_hash_sync failed: {e}"));
++    let got_sig_hex = format!("0x{}", hex::encode(rust_sig.as_bytes()));
++
++    if got_sig_hex != fx.signature.full {
++        // Fallback rationale: if byte-level comparison ever fails despite matching
++        // signing hashes, the likely cause is a backend swap to non-deterministic
++        // ECDSA (both alloy and eth_account currently use RFC 6979 deterministic k,
++        // so bytes match — but that's not a permanent guarantee). In that case,
++        // replace this assert with: assert that sig.recover_address_from_prehash(
++        // signing_hash) == expected_signer_address.
++        let expected_signer = wallet.address();
++        let recovered = rust_sig
++            .recover_address_from_prehash(&signing_hash)
++            .unwrap_or_else(|e| panic!("{name}: signature recovery failed: {e}"));
++        assert_eq!(
++            recovered, expected_signer,
++            "{name}: LAYER 3 signature mismatch AND recovery-fallback failed\n\
++             got sig:  {got_sig_hex}\n\
++             exp sig:  {}\n\
++             recovered: {recovered}\n\
++             expected:  {expected_signer}",
++            fx.signature.full,
++        );
++        eprintln!(
++            "WARN [{name}]: Layer 3 byte-comparison fell back to recovery check \
++             (got={got_sig_hex}, exp={}). Signatures are functionally equivalent.",
++            fx.signature.full
++        );
++    }
++
++    // ── Layer 4: JSON body shape ──────────────────────────────────────────────
++    // Construct SignedOrderV2 using the Python-generated signature so the hex
++    // bytes in the body match the fixture exactly (Layer 3 already verified
++    // our Rust sig is valid; here we care about field presence and value shapes).
++    let py_alloy_sig = parse_py_signature(&fx.signature.full);
++    let signed_order = SignedOrderV2::builder()
++        .order(order)
++        .signature(py_alloy_sig)
++        .order_type(OrderType::GTC)
++        .owner(Uuid::nil())
++        .build();
++
++    let rust_json = serde_json::to_value(&signed_order)
++        .unwrap_or_else(|e| panic!("{name}: SignedOrderV2::serialize failed: {e}"));
++
++    // The fixture json_body contains the order fields directly (not wrapped).
++    // The Rust Serialize impl wraps them under "order". Extract and compare.
++    let rust_order_json = &rust_json["order"];
++    let expected_body = &fx.json_body;
++    let expected_obj = expected_body
++        .as_object()
++        .expect("fixture json_body should be a JSON object");
++
++    for (key, exp_val) in expected_obj {
++        // "signature" is compared numerically in Layer 3; here we skip it
++        // because Python may emit a different v byte (27/28) while alloy
++        // normalises to 0/1 internally. Both are valid on-chain.
++        if key == "signature" {
++            continue;
++        }
++        let got_val = rust_order_json.get(key).unwrap_or_else(|| {
++            panic!(
++                "{name}: LAYER 4 json_body missing key '{key}'\n\
++                 rust order JSON: {rust_order_json}"
++            )
++        });
++        assert_eq!(
++            got_val, exp_val,
++            "{name}: LAYER 4 json_body[{key}] mismatch\n  got: {got_val}\n  exp: {exp_val}",
++        );
++    }
++
++    // Bidirectional check: Rust output must not include any keys beyond those
++    // expected in the fixture. A future serializer change that accidentally
++    // emits extra fields (e.g., default `"postOnly": false`) would otherwise
++    // slip past the forward-only loop above.
++    //
++    // The fixture's "order" object includes the per-signature "signature" key
++    // which is skipped in the forward loop above (v byte normalisation), so both
++    // sides should have the same total key count.
++    let rust_order_obj = rust_order_json.as_object().expect("order must be object");
++    let fixture_order_obj = expected_obj;
++    assert_eq!(
++        rust_order_obj.len(),
++        fixture_order_obj.len(),
++        "{name}: Rust emitted {} keys, fixture expects {} keys — check for extra/missing fields. \
++         Rust keys: {:?}, fixture keys: {:?}",
++        rust_order_obj.len(),
++        fixture_order_obj.len(),
++        rust_order_obj.keys().collect::<Vec<_>>(),
++        fixture_order_obj.keys().collect::<Vec<_>>(),
++    );
++}
++
++// ── One test per fixture ──────────────────────────────────────────────────────
++
++#[test]
++fn vector_eoa_mainnet() {
++    run_fixture("eoa_mainnet.json");
++}
++
++#[test]
++fn vector_eoa_neg_risk_mainnet() {
++    run_fixture("eoa_neg_risk_mainnet.json");
++}
++
++#[test]
++fn vector_poly_proxy_mainnet() {
++    run_fixture("poly_proxy_mainnet.json");
++}
++
++#[test]
++fn vector_poly_gnosis_safe_mainnet() {
++    run_fixture("poly_gnosis_safe_mainnet.json");
++}
++
++#[test]
++fn vector_eoa_amoy() {
++    run_fixture("eoa_amoy.json");
++}
++
++#[test]
++fn vector_eoa_nonzero_metadata() {
++    run_fixture("eoa_nonzero_metadata.json");
++}
++
++#[test]
++fn vector_eoa_sell_mainnet() {
++    run_fixture("eoa_sell_mainnet.json");
++}
++

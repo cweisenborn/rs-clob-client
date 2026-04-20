@@ -19,6 +19,19 @@ use crate::types::Decimal;
 pub mod request;
 pub mod response;
 
+/// Which version of the Polymarket CTF Exchange an order targets.
+///
+/// V1 uses exchange `0x4bFb...982E` (standard) / `0xC5d5...f80a` (neg-risk) and
+/// EIP-712 domain version `"1"`. V2 uses exchange `0xE111...996B` / `0xe222...0F59`
+/// and domain version `"2"`. Runtime flag, not a Cargo feature — avoids recompile
+/// to roll back.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OrderVersion {
+    #[default]
+    V1,
+    V2,
+}
+
 // Re-export RFQ types for convenient access
 #[cfg(feature = "rfq")]
 pub use request::{
@@ -454,6 +467,63 @@ sol! {
     }
 }
 
+/// Inner module so that the `sol!` struct can be named `Order` (matching the
+/// on-chain EIP-712 `primaryType` used by `CTFExchangeV2`) without conflicting
+/// with the V1 `Order` struct defined in this file.
+///
+/// The public re-export as `OrderV2` keeps the Rust call-sites readable.
+/// The EIP-712 type string produced by `eip712_root_type()` will be
+/// `Order(uint256 salt,address maker,...)` — exactly what the contract expects.
+mod order_v2_inner {
+    use serde::Serialize;
+    use serde_with::{DisplayFromStr, serde_as};
+
+    alloy::core::sol! {
+        /// V2 order struct — matches `CTFExchangeV2` contract typed data.
+        ///
+        /// EIP-712 `primaryType` is `"Order"` (not `"OrderV2"`) so that the struct
+        /// hash matches what the on-chain `CTFExchangeV2` contract verifies.
+        ///
+        /// Differences from V1:
+        ///   added:   timestamp (uint256), metadata (bytes32), builder (bytes32)
+        ///   removed: taker, expiration (from digest), nonce, feeRateBps
+        ///
+        /// Fees are protocol-level in V2. `expiration` still appears in the POST
+        /// body as `"0"` for compat but is NOT part of the EIP-712 signing hash.
+        #[non_exhaustive]
+        #[serde_as]
+        #[derive(Serialize, Debug, Default, PartialEq)]
+        struct Order {
+            #[serde(serialize_with = "crate::clob::types::ser_salt")]
+            uint256 salt;
+            address maker;
+            address signer;
+            #[serde_as(as = "DisplayFromStr")]
+            uint256 tokenId;
+            #[serde_as(as = "DisplayFromStr")]
+            uint256 makerAmount;
+            #[serde_as(as = "DisplayFromStr")]
+            uint256 takerAmount;
+            uint8   side;
+            uint8   signatureType;
+            #[serde_as(as = "DisplayFromStr")]
+            uint256 timestamp;
+            bytes32 metadata;
+            bytes32 builder;
+        }
+    }
+}
+
+/// V2 order struct — matches `CTFExchangeV2` contract typed data.
+///
+/// The EIP-712 type name is `"Order"` (the on-chain primary type), so the
+/// struct hash matches what `CTFExchangeV2` verifies.
+///
+/// Differences from V1 `Order`:
+///   added:   `timestamp` (uint256), `metadata` (bytes32), `builder` (bytes32)
+///   removed: `taker`, `expiration` (from digest), `nonce`, `feeRateBps`
+pub use order_v2_inner::Order as OrderV2;
+
 // CLOB expects salt as a JSON number. U256 as an integer will not fit as a JSON number. Since
 // we generated the salt as a u64 originally (see `salt_generator`), we can be very confident that
 // we can invert the conversion to U256 and return a u64 when serializing.
@@ -477,6 +547,25 @@ pub struct SignableOrder {
 #[derive(Debug, Builder, PartialEq)]
 pub struct SignedOrder {
     pub order: Order,
+    pub signature: Signature,
+    pub order_type: OrderType,
+    pub owner: ApiKey,
+    pub post_only: Option<bool>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, Serialize, Builder, PartialEq)]
+pub struct SignableOrderV2 {
+    pub order: OrderV2,
+    pub order_type: OrderType,
+    #[serde(rename = "postOnly", skip_serializing_if = "Option::is_none")]
+    pub post_only: Option<bool>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Builder, PartialEq)]
+pub struct SignedOrderV2 {
+    pub order: OrderV2,
     pub signature: Signature,
     pub order_type: OrderType,
     pub owner: ApiKey,
@@ -551,6 +640,134 @@ impl Serialize for SignedOrder {
         }
 
         st.end()
+    }
+}
+
+/// Helper struct for serializing V2 Order with signature injected.
+///
+/// Note: `expiration` is included as `"0"` in the POST body for compat but
+/// is NOT part of the EIP-712 digest. `metadata` and `builder` are `bytes32`
+/// and serialize as `0x`-prefixed 64-hex strings.
+#[serde_as]
+#[derive(Serialize)]
+struct OrderWithSignatureV2<'order> {
+    #[serde(serialize_with = "ser_salt")]
+    salt: &'order U256,
+    maker: &'order alloy::primitives::Address,
+    signer: &'order alloy::primitives::Address,
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(rename = "tokenId")]
+    token_id: &'order U256,
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(rename = "makerAmount")]
+    maker_amount: &'order U256,
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(rename = "takerAmount")]
+    taker_amount: &'order U256,
+    /// Side serialized as "BUY"/"SELL" string (CLOB API requirement)
+    side: Side,
+    /// Always serialized as the string "0" for V2 POST-body compatibility.
+    /// Not part of the V2 EIP-712 digest.
+    expiration: &'static str,
+    #[serde(rename = "signatureType")]
+    signature_type: u8,
+    #[serde_as(as = "DisplayFromStr")]
+    timestamp: &'order U256,
+    /// `bytes32` serializes as 0x-prefixed 64-hex.
+    metadata: &'order alloy::primitives::FixedBytes<32>,
+    builder: &'order alloy::primitives::FixedBytes<32>,
+    /// Signature injected into the order object.
+    signature: String,
+}
+
+impl Serialize for SignedOrderV2 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let len = if self.post_only.is_some() { 4 } else { 3 };
+        let mut st = serializer.serialize_struct("SignedOrderV2", len)?;
+
+        let side = Side::try_from(self.order.side).map_err(S::Error::custom)?;
+
+        st.serialize_field(
+            "order",
+            &OrderWithSignatureV2 {
+                salt: &self.order.salt,
+                maker: &self.order.maker,
+                signer: &self.order.signer,
+                token_id: &self.order.tokenId,
+                maker_amount: &self.order.makerAmount,
+                taker_amount: &self.order.takerAmount,
+                side,
+                expiration: "0",
+                signature_type: self.order.signatureType,
+                timestamp: &self.order.timestamp,
+                metadata: &self.order.metadata,
+                builder: &self.order.builder,
+                signature: self.signature.to_string(),
+            },
+        )?;
+        st.serialize_field("owner", &self.owner)?;
+        st.serialize_field("orderType", &self.order_type)?;
+        if let Some(po) = self.post_only {
+            st.serialize_field("postOnly", &po)?;
+        }
+        st.end()
+    }
+}
+
+/// Dispatch wrapper for an unsigned order in either V1 or V2 shape.
+#[derive(Debug)]
+pub enum AnyOrder {
+    V1(Order),
+    V2(OrderV2),
+}
+
+impl AnyOrder {
+    pub fn version(&self) -> OrderVersion {
+        match self {
+            Self::V1(_) => OrderVersion::V1,
+            Self::V2(_) => OrderVersion::V2,
+        }
+    }
+}
+
+/// Dispatch wrapper for a signable order in either V1 or V2 shape.
+#[derive(Debug)]
+pub enum AnySignableOrder {
+    V1(SignableOrder),
+    V2(SignableOrderV2),
+}
+
+impl AnySignableOrder {
+    pub fn version(&self) -> OrderVersion {
+        match self {
+            Self::V1(_) => OrderVersion::V1,
+            Self::V2(_) => OrderVersion::V2,
+        }
+    }
+}
+
+/// Dispatch wrapper for a signed order in either V1 or V2 shape.
+#[derive(Debug)]
+pub enum AnySignedOrder {
+    V1(SignedOrder),
+    V2(SignedOrderV2),
+}
+
+impl AnySignedOrder {
+    pub fn version(&self) -> OrderVersion {
+        match self {
+            Self::V1(_) => OrderVersion::V1,
+            Self::V2(_) => OrderVersion::V2,
+        }
+    }
+}
+
+impl Serialize for AnySignedOrder {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::V1(o) => o.serialize(serializer),
+            Self::V2(o) => o.serialize(serializer),
+        }
     }
 }
 
