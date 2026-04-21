@@ -400,7 +400,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
 
         let timestamp = U256::from(
             u64::try_from(Utc::now().timestamp())
-                .unwrap_or(0),
+                .expect("system clock is post-1970"),
         );
 
         let order = OrderV2 {

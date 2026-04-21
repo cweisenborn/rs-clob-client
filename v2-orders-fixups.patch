@@ -1,0 +1,65 @@
+From 816ccf062f2378010863a204ef4c5e468d2ebd56 Mon Sep 17 00:00:00 2001
+From: Chris Weisenborn <cweisenborn888@gmail.com>
+Date: Mon, 20 Apr 2026 23:11:29 -0400
+Subject: [PATCH] fix(v2): code review follow-ups (Result-style sign_any_order,
+ hide v2_domain_for_test, panic on pre-1970 clock)
+
+Three small fixes from the V2 order code review (issues 2, 4, 8):
+
+- src/clob/client.rs (sign_any_order, V2 arm): replace `.expect("chain_id set")`
+  with `.ok_or_else(|| Error::validation(...))?` so the function honors its
+  declared `Result` signature instead of panicking. Mirrors the pattern used by
+  `create_headers` and `sign` for the V1 path.
+
+- src/clob/client.rs (v2_domain_for_test): mark `#[doc(hidden)]` and clarify
+  that this helper is for golden-vector parity, not the stable public API.
+
+- src/clob/order_builder.rs (build_v2 timestamp): replace silent `.unwrap_or(0)`
+  with `.expect("system clock is post-1970")`. Silent zero would corrupt the
+  V2 EIP-712 signing hash; a panic at least surfaces the impossibility loudly.
+---
+ src/clob/client.rs        | 7 +++++--
+ src/clob/order_builder.rs | 2 +-
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/clob/client.rs b/src/clob/client.rs
+index d931c78..9047797 100644
+--- a/src/clob/client.rs
++++ b/src/clob/client.rs
+@@ -70,7 +70,8 @@ const VERSION_V2: Option<Cow<'static, str>> = Some(Cow::Borrowed("2"));
+ const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
+ 
+ /// Build the V2 EIP-712 domain for a given chain + neg-risk flag. Exposed for
+-/// test / golden-vector parity.
++/// test / golden-vector parity. Not part of the stable public API.
++#[doc(hidden)]
+ pub fn v2_domain_for_test(chain_id: u64, neg_risk: bool) -> Option<Eip712Domain> {
+     let cfg = contract_config(chain_id, neg_risk)?;
+     let ex = cfg.exchange_v2?;
+@@ -1533,7 +1534,9 @@ impl<K: Kind> Client<Authenticated<K>> {
+                 Ok(AnySignedOrder::V1(signed))
+             }
+             AnySignableOrder::V2(SignableOrderV2 { order, order_type, post_only, .. }) => {
+-                let chain_id = signer.chain_id().expect("chain_id set");
++                let chain_id = signer.chain_id().ok_or_else(|| {
++                    Error::validation("Chain id not set, be sure to provide one on the signer")
++                })?;
+                 let token_id = order.tokenId;
+                 let neg_risk = self.neg_risk(token_id).await?.neg_risk;
+                 let cfg = contract_config(chain_id, neg_risk)
+diff --git a/src/clob/order_builder.rs b/src/clob/order_builder.rs
+index 943e015..0e2fb6b 100644
+--- a/src/clob/order_builder.rs
++++ b/src/clob/order_builder.rs
+@@ -400,7 +400,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
+ 
+         let timestamp = U256::from(
+             u64::try_from(Utc::now().timestamp())
+-                .unwrap_or(0),
++                .expect("system clock is post-1970"),
+         );
+ 
+         let order = OrderV2 {
+-- 
+2.43.0
+

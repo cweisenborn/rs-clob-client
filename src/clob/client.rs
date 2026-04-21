@@ -70,7 +70,8 @@ const VERSION_V2: Option<Cow<'static, str>> = Some(Cow::Borrowed("2"));
 const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
 
 /// Build the V2 EIP-712 domain for a given chain + neg-risk flag. Exposed for
-/// test / golden-vector parity.
+/// test / golden-vector parity. Not part of the stable public API.
+#[doc(hidden)]
 pub fn v2_domain_for_test(chain_id: u64, neg_risk: bool) -> Option<Eip712Domain> {
     let cfg = contract_config(chain_id, neg_risk)?;
     let ex = cfg.exchange_v2?;
@@ -1533,7 +1534,9 @@ impl<K: Kind> Client<Authenticated<K>> {
                 Ok(AnySignedOrder::V1(signed))
             }
             AnySignableOrder::V2(SignableOrderV2 { order, order_type, post_only, .. }) => {
-                let chain_id = signer.chain_id().expect("chain_id set");
+                let chain_id = signer.chain_id().ok_or_else(|| {
+                    Error::validation("Chain id not set, be sure to provide one on the signer")
+                })?;
                 let token_id = order.tokenId;
                 let neg_risk = self.neg_risk(token_id).await?.neg_risk;
                 let cfg = contract_config(chain_id, neg_risk)
