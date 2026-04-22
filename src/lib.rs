@@ -69,6 +69,11 @@ static CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
         collateral: address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
         conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
+        pusd: Some(address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")),
+        collateral_onramp: Some(address!("0x93070a847efEf7F70739046A929D47a521F5B8ee")),
+        collateral_offramp: Some(address!("0x2957922Eb93258b93368531d39fAcCA3B4dC5854")),
+        ctf_collateral_adapter: Some(address!("0xADa100874d00e3331D00F2007a9c336a65009718")),
+        neg_risk_ctf_collateral_adapter: Some(address!("0xAdA200001000ef00D07553cEE7006808F895c6F1")),
     },
     80002_u64 => ContractConfig {
         exchange: address!("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40"),
@@ -78,6 +83,11 @@ static CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
         collateral: address!("0x9c4e1703476e875070ee25b56a58b008cfb8fa78"),
         conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
+        pusd: None,
+        collateral_onramp: None,
+        collateral_offramp: None,
+        ctf_collateral_adapter: None,
+        neg_risk_ctf_collateral_adapter: None,
     },
 };
 
@@ -110,16 +120,28 @@ pub struct ContractConfig {
     pub exchange: Address,
     /// V2 standard exchange. `None` on chains where V2 hasn't deployed.
     pub exchange_v2: Option<Address>,
-    /// V1 neg-risk exchange (today's `NEG_RISK_CONFIG[chain].exchange`).
+    /// V1 neg-risk exchange.
     pub neg_risk_exchange: Option<Address>,
     /// V2 neg-risk exchange.
     pub neg_risk_exchange_v2: Option<Address>,
+    /// V1 / legacy collateral token (USDC.e on Polygon mainnet). V2 uses `pusd`.
     pub collateral: Address,
     pub conditional_tokens: Address,
-    /// Neg-risk adapter contract. Used for merge/split/redeem on neg-risk markets
-    /// and must be granted ERC-20/ERC-1155 approvals by any wallet trading those
-    /// markets. Shared across V1 and V2.
+    /// OLD neg-risk adapter — USDC.e-denominated immutable. Used by V1 paths only.
+    /// Shared across chains but **never** part of V2 approval sets or V2 adapter dispatch.
     pub neg_risk_adapter: Option<Address>,
+    /// Polymarket USD (pUSD) — V2 settlement collateral. `None` where V2 hasn't deployed.
+    pub pusd: Option<Address>,
+    /// Collateral Onramp — wraps USDC.e → pUSD.
+    pub collateral_onramp: Option<Address>,
+    /// Collateral Offramp — unwraps pUSD → USDC.e.
+    pub collateral_offramp: Option<Address>,
+    /// V2 CTF Collateral Adapter — pUSD-denominated wrapper around the old adapter.
+    /// V2 split/merge/redeem for standard markets targets this.
+    pub ctf_collateral_adapter: Option<Address>,
+    /// V2 NegRisk CTF Collateral Adapter — pUSD-denominated wrapper around the old adapter.
+    /// V2 split/merge/redeem for neg-risk markets targets this.
+    pub neg_risk_ctf_collateral_adapter: Option<Address>,
 }
 
 /// Wallet contract configuration for CREATE2 address derivation
@@ -439,6 +461,60 @@ mod tests {
         // Unsupported chain should return None
         assert!(derive_proxy_wallet(eoa, 1).is_none());
         assert!(derive_safe_wallet(eoa, 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod v2_contract_config_tests {
+    use super::*;
+
+    #[test]
+    fn chain_137_has_v2_collateral_fields() {
+        let cfg = contract_config(137, false).expect("chain 137 config");
+
+        // V1 legacy — unchanged.
+        assert_eq!(
+            cfg.collateral,
+            address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+            "V1 collateral stays USDC.e"
+        );
+
+        // CR-1 new V2 fields.
+        assert_eq!(
+            cfg.pusd,
+            Some(address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")),
+            "pUSD"
+        );
+        assert_eq!(
+            cfg.collateral_onramp,
+            Some(address!("0x93070a847efEf7F70739046A929D47a521F5B8ee")),
+            "Collateral Onramp"
+        );
+        assert_eq!(
+            cfg.collateral_offramp,
+            Some(address!("0x2957922Eb93258b93368531d39fAcCA3B4dC5854")),
+            "Collateral Offramp"
+        );
+        assert_eq!(
+            cfg.ctf_collateral_adapter,
+            Some(address!("0xADa100874d00e3331D00F2007a9c336a65009718")),
+            "V2 CTF Collateral Adapter (new wrapper)"
+        );
+        assert_eq!(
+            cfg.neg_risk_ctf_collateral_adapter,
+            Some(address!("0xAdA200001000ef00D07553cEE7006808F895c6F1")),
+            "V2 NegRisk CTF Collateral Adapter (new wrapper)"
+        );
+    }
+
+    #[test]
+    fn chain_80002_v2_fields_are_none() {
+        let cfg = contract_config(80002, false).expect("chain 80002 config");
+        assert!(cfg.pusd.is_none());
+        assert!(cfg.collateral_onramp.is_none());
+        assert!(cfg.collateral_offramp.is_none());
+        assert!(cfg.ctf_collateral_adapter.is_none());
+        assert!(cfg.neg_risk_ctf_collateral_adapter.is_none());
     }
 }
 
