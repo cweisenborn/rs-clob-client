@@ -12,7 +12,7 @@ use serde_with::{
     DefaultOnError, DefaultOnNull, NoneAsEmptyString, TimestampMilliSeconds, TimestampSeconds,
     TryFromInto, serde_as,
 };
-use sha2::{Digest as _, Sha256};
+use sha1::{Digest as _, Sha1};
 use uuid::Uuid;
 
 use crate::Result;
@@ -138,13 +138,69 @@ pub struct OrderBookSummaryResponse {
 }
 
 impl OrderBookSummaryResponse {
+    /// Orderbook summary hash — SHA1 over compact JSON with fixed key order
+    /// and `hash` field set to `""` during hashing. Byte-matches
+    /// py-clob-client-v2's `generate_orderbook_summary_hash`.
+    ///
+    /// Key order (py SDK authoritative):
+    ///   market, asset_id, timestamp, hash (""), bids, asks,
+    ///   min_order_size, tick_size, neg_risk, last_trade_price
+    ///
+    /// All numeric fields are serialized as strings (matching the py SDK's
+    /// `str`-typed fields). Bids/asks entries use `{"price": str, "size": str}`.
+    ///
+    /// # Breaking change vs pre-CR-11
+    ///
+    /// This method previously produced a SHA-256 hash over the struct's full
+    /// serialized JSON with non-deterministic field order. Any hash values
+    /// stored or compared against output from that implementation are
+    /// invalid and must be recomputed with the current algorithm.
     pub fn hash(&self) -> Result<String> {
-        let json = serde_json::to_string(&self)?;
+        // Build bids/asks as arrays of {"price": str, "size": str}.
+        let bids: Vec<serde_json::Value> = self
+            .bids
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "price": o.price.to_string(),
+                    "size": o.size.to_string(),
+                })
+            })
+            .collect();
+        let asks: Vec<serde_json::Value> = self
+            .asks
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "price": o.price.to_string(),
+                    "size": o.size.to_string(),
+                })
+            })
+            .collect();
 
-        let mut hasher = Sha256::new();
-        hasher.update(json.as_bytes());
+        // Fixed key order matching py SDK utilities.py.
+        // serde_json's preserve_order feature ensures json! preserves
+        // insertion order in the serialized output.
+        let payload = serde_json::json!({
+            "market": format!("{:#x}", self.market),
+            "asset_id": self.asset_id.to_string(),
+            "timestamp": self.timestamp.timestamp_millis().to_string(),
+            "hash": "",
+            "bids": bids,
+            "asks": asks,
+            "min_order_size": self.min_order_size.to_string(),
+            "tick_size": self.tick_size.as_decimal().to_string(),
+            "neg_risk": self.neg_risk,
+            "last_trade_price": self.last_trade_price.map(|d| d.to_string()),
+        });
+
+        // serde_json::to_string produces compact JSON (no whitespace),
+        // matching py's json.dumps(..., separators=(',', ':')).
+        let compact = serde_json::to_string(&payload)
+            .expect("OrderBookSummaryResponse is always JSON-serializable");
+        let mut hasher = Sha1::new();
+        hasher.update(compact.as_bytes());
         let result = hasher.finalize();
-
         Ok(format!("{result:x}"))
     }
 }

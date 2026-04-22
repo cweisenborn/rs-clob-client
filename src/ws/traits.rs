@@ -43,6 +43,12 @@ pub trait WithCredentials: Serialize + Sized {
         });
 
         if let Value::Object(ref mut obj) = payload_json {
+            // NOTE: serde_json's preserve_order feature is enabled (for CR-11's
+            // orderbook hash fixed-key-order requirement). One consequence: this
+            // `insert("auth", ...)` appends at the end of the object rather than
+            // slotting alphabetically. The Polymarket WebSocket server parses
+            // auth fields by name, not position, so the different placement is
+            // behaviourally benign — but the change is worth flagging here.
             obj.insert("auth".to_owned(), auth);
         }
 
