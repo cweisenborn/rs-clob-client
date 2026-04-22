@@ -297,4 +297,40 @@ mod neg_risk {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn with_neg_risk_v2_chain_137_ok() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let provider = ProviderBuilder::new().connect(&server.base_url()).await?;
+
+        let result = Client::with_neg_risk_v2(provider, 137);
+        assert!(result.is_ok(), "chain 137 has V2 neg-risk adapter configured");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_neg_risk_v2_chain_80002_errors() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let provider = ProviderBuilder::new().connect(&server.base_url()).await?;
+
+        let result = Client::with_neg_risk_v2(provider, 80002);
+        assert!(
+            result.is_err(),
+            "chain 80002 has no V2 neg-risk adapter (neg_risk_ctf_collateral_adapter is None)"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_neg_risk_v2_chain_unknown_errors() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let provider = ProviderBuilder::new().connect(&server.base_url()).await?;
+
+        let result = Client::with_neg_risk_v2(provider, 999_999);
+        assert!(result.is_err(), "unknown chain ID has no configuration");
+
+        Ok(())
+    }
 }

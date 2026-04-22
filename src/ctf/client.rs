@@ -116,6 +116,12 @@ sol! {
 
     #[sol(rpc)]
     interface INegRiskAdapter {
+        /// Simplified split — adapter handles collateral + partition internally.
+        function splitPosition(bytes32 conditionId, uint256 amount) external;
+
+        /// Simplified merge — adapter handles collateral + partition internally.
+        function mergePositions(bytes32 conditionId, uint256 amount) external;
+
         /// Redeems positions from negative risk markets with specific amounts.
         function redeemPositions(
             bytes32 conditionId,
@@ -187,6 +193,41 @@ impl<P: Provider + Clone> Client<P> {
         let neg_risk_adapter = config
             .neg_risk_adapter
             .map(|addr| INegRiskAdapter::new(addr, provider.clone()));
+
+        Ok(Self {
+            contract,
+            neg_risk_adapter,
+            provider,
+        })
+    }
+
+    /// Creates a CTF client that dispatches neg-risk split/merge/redeem through
+    /// the V2 wrapper adapter (`config.neg_risk_ctf_collateral_adapter`) —
+    /// pUSD-denominated.
+    ///
+    /// Use this for V2 neg-risk markets post-cutover. V1 neg-risk markets should
+    /// continue using `with_neg_risk` (which targets the OLD adapter at
+    /// `config.neg_risk_adapter`, USDC.e-denominated).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the chain has no V2 neg-risk adapter configured
+    /// (e.g., Amoy pre-V2-deployment).
+    pub fn with_neg_risk_v2(provider: P, chain_id: ChainId) -> Result<Self> {
+        let config = contract_config(chain_id, true).ok_or_else(|| {
+            CtfError::ContractCall(format!(
+                "NegRisk contract configuration not found for chain ID {chain_id}"
+            ))
+        })?;
+
+        let adapter_addr = config.neg_risk_ctf_collateral_adapter.ok_or_else(|| {
+            CtfError::ContractCall(format!(
+                "V2 neg-risk CTF collateral adapter not configured for chain ID {chain_id}"
+            ))
+        })?;
+
+        let contract = IConditionalTokens::new(config.conditional_tokens, provider.clone());
+        let neg_risk_adapter = Some(INegRiskAdapter::new(adapter_addr, provider.clone()));
 
         Ok(Self {
             contract,
@@ -432,6 +473,108 @@ impl<P: Provider + Clone> Client<P> {
             .map_err(|e| CtfError::ContractCall(format!("Failed to get redeem receipt: {e}")))?;
 
         Ok(RedeemPositionsResponse {
+            transaction_hash,
+            block_number: receipt.block_number.ok_or_else(|| {
+                CtfError::ContractCall("Block number not available in receipt".to_owned())
+            })?,
+        })
+    }
+
+    /// Splits via the configured NegRisk adapter's 2-arg simplified signature.
+    ///
+    /// The adapter handles collateral + partition internally. For V1, this targets
+    /// the OLD adapter (USDC.e) when constructed via `with_neg_risk`. For V2, it
+    /// targets the NEW wrapper (pUSD) when constructed via `with_neg_risk_v2`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - This client was constructed without a NegRisk adapter (i.e., plain `Client::new`)
+    /// - The transaction fails to send
+    /// - The transaction fails to be mined
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "debug", skip(self), fields(
+            condition_id = %condition_id,
+            amount = %amount
+        ))
+    )]
+    pub async fn split_position_neg_risk(
+        &self,
+        condition_id: alloy::primitives::B256,
+        amount: alloy::primitives::U256,
+    ) -> Result<SplitPositionResponse> {
+        let adapter = self.neg_risk_adapter.as_ref().ok_or_else(|| {
+            CtfError::ContractCall(
+                "NegRisk adapter not configured — use with_neg_risk or with_neg_risk_v2".to_owned(),
+            )
+        })?;
+
+        let pending_tx = adapter
+            .splitPosition(condition_id, amount)
+            .send()
+            .await
+            .map_err(|e| {
+                CtfError::ContractCall(format!("Failed to send NegRisk split transaction: {e}"))
+            })?;
+
+        let transaction_hash = *pending_tx.tx_hash();
+
+        let receipt = pending_tx.get_receipt().await.map_err(|e| {
+            CtfError::ContractCall(format!("Failed to get NegRisk split receipt: {e}"))
+        })?;
+
+        Ok(SplitPositionResponse {
+            transaction_hash,
+            block_number: receipt.block_number.ok_or_else(|| {
+                CtfError::ContractCall("Block number not available in receipt".to_owned())
+            })?,
+        })
+    }
+
+    /// Merges via the configured NegRisk adapter's 2-arg simplified signature.
+    ///
+    /// See `split_position_neg_risk` for dispatch semantics (V1 vs V2 adapter).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - This client was constructed without a NegRisk adapter (i.e., plain `Client::new`)
+    /// - The transaction fails to send
+    /// - The transaction fails to be mined
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "debug", skip(self), fields(
+            condition_id = %condition_id,
+            amount = %amount
+        ))
+    )]
+    pub async fn merge_positions_neg_risk(
+        &self,
+        condition_id: alloy::primitives::B256,
+        amount: alloy::primitives::U256,
+    ) -> Result<MergePositionsResponse> {
+        let adapter = self.neg_risk_adapter.as_ref().ok_or_else(|| {
+            CtfError::ContractCall(
+                "NegRisk adapter not configured — use with_neg_risk or with_neg_risk_v2".to_owned(),
+            )
+        })?;
+
+        let pending_tx = adapter
+            .mergePositions(condition_id, amount)
+            .send()
+            .await
+            .map_err(|e| {
+                CtfError::ContractCall(format!("Failed to send NegRisk merge transaction: {e}"))
+            })?;
+
+        let transaction_hash = *pending_tx.tx_hash();
+
+        let receipt = pending_tx.get_receipt().await.map_err(|e| {
+            CtfError::ContractCall(format!("Failed to get NegRisk merge receipt: {e}"))
+        })?;
+
+        Ok(MergePositionsResponse {
             transaction_hash,
             block_number: receipt.block_number.ok_or_else(|| {
                 CtfError::ContractCall("Block number not available in receipt".to_owned())
