@@ -110,6 +110,7 @@ fn build_v2_assembles_ms_timestamp() {
         SignatureType::Eoa,
         FixedBytes::<32>::ZERO,    // metadata
         FixedBytes::<32>::ZERO,    // builder
+        U256::ZERO,                // expiration (GTC — not relevant for this test)
     );
 
     let signable = result.expect("assemble_signable_order_v2 must succeed with valid inputs");

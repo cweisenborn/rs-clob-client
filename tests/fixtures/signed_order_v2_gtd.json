@@ -1,0 +1,25 @@
+{
+  "expiration_secs": 1800003600,
+  "pinned_ms_timestamp": 1800000000000,
+  "post_body": {
+    "deferExec": false,
+    "order": {
+      "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "expiration": "1800003600",
+      "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "makerAmount": "5000000",
+      "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "salt": 9999999,
+      "side": "BUY",
+      "signature": "0x9ad414606cd7eb73361dab43b8b9c88eaa29c5f565b9a718a3929c6449e688132bfc8f5f3ade3ebb57410c7929725d4cd5e70f8b5772e51a4b211905374fd4931b",
+      "signatureType": 0,
+      "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "takerAmount": "10000000",
+      "timestamp": "1800000000000",
+      "tokenId": "12345678901234567890"
+    },
+    "orderType": "GTD",
+    "owner": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    "postOnly": false
+  }
+}

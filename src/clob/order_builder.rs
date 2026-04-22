@@ -389,6 +389,20 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             ));
         }
 
+        // Convert the optional DateTime<Utc> expiration to U256 seconds.
+        // 0 = GTC (no expiration), non-zero = GTD (seconds since Unix epoch).
+        // NOTE: expiration is seconds — different unit than `timestamp`, which
+        // is milliseconds (see compute_timestamp). Both are intentional and
+        // match py-clob-client-v2's `order_data_v2`.
+        let expiration_secs = match self.expiration {
+            None => U256::ZERO,
+            Some(dt) => U256::from(dt.timestamp().to_u64().ok_or_else(|| {
+                Error::validation(format!(
+                    "Unable to represent expiration {dt} as a u64"
+                ))
+            })?),
+        };
+
         assemble_signable_order_v2(
             token_id,
             side,
@@ -404,6 +418,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             self.signature_type,
             self.metadata,
             self.builder_field,
+            expiration_secs,
         )
     }
 }
@@ -646,6 +661,7 @@ pub fn assemble_signable_order_v2(
     signature_type: SignatureType,
     metadata: FixedBytes<32>,
     builder_field: FixedBytes<32>,
+    expiration: U256,
 ) -> Result<SignableOrderV2> {
     // EIP-1271 smart-contract signing is not yet implemented. Reject early so
     // callers get a clear error rather than an order with an unusable signature.
@@ -696,6 +712,7 @@ pub fn assemble_signable_order_v2(
         order,
         order_type,
         post_only: Some(post_only),
+        expiration,
     })
 }
 

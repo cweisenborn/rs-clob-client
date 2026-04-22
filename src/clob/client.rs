@@ -1533,7 +1533,7 @@ impl<K: Kind> Client<Authenticated<K>> {
                 let signed = self.sign(signer, s).await?;
                 Ok(AnySignedOrder::V1(signed))
             }
-            AnySignableOrder::V2(SignableOrderV2 { order, order_type, post_only, .. }) => {
+            AnySignableOrder::V2(SignableOrderV2 { order, order_type, post_only, expiration }) => {
                 let chain_id = signer.chain_id().ok_or_else(|| {
                     Error::validation("Chain id not set, be sure to provide one on the signer")
                 })?;
@@ -1558,7 +1558,8 @@ impl<K: Kind> Client<Authenticated<K>> {
                     .order(order)
                     .signature(signature)
                     .order_type(order_type)
-                    .owner(self.state().credentials.key);
+                    .owner(self.state().credentials.key)
+                    .expiration(expiration);
                 let signed = match post_only {
                     Some(po) => builder.post_only(po).build(),
                     None => builder.build(),

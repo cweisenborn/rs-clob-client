@@ -495,7 +495,8 @@ mod order_v2_inner {
         ///   removed: taker, expiration (from digest), nonce, feeRateBps
         ///
         /// Fees are protocol-level in V2. `expiration` still appears in the POST
-        /// body as `"0"` for compat but is NOT part of the EIP-712 signing hash.
+        /// body (as a decimal-string seconds value; `"0"` = GTC) but is NOT part
+        /// of the EIP-712 signing hash.
         #[non_exhaustive]
         #[serde_as]
         #[derive(Serialize, Debug, Default, PartialEq)]
@@ -566,6 +567,11 @@ pub struct SignableOrderV2 {
     pub order_type: OrderType,
     #[serde(rename = "postOnly", skip_serializing_if = "Option::is_none")]
     pub post_only: Option<bool>,
+    /// Expiration as Unix epoch seconds; 0 = GTC (no expiration).
+    /// NOT part of the EIP-712 digest — only threaded into the POST body.
+    /// Defaults to `U256::ZERO` (GTC) when not set via the builder.
+    #[builder(default)]
+    pub expiration: U256,
 }
 
 #[non_exhaustive]
@@ -576,6 +582,11 @@ pub struct SignedOrderV2 {
     pub order_type: OrderType,
     pub owner: ApiKey,
     pub post_only: Option<bool>,
+    /// Expiration as Unix epoch seconds; 0 = GTC (no expiration).
+    /// NOT part of the EIP-712 digest — only serialized into the POST body.
+    /// Defaults to `U256::ZERO` (GTC) when not set via the builder.
+    #[builder(default)]
+    pub expiration: U256,
 }
 
 /// Helper struct for serializing Order with signature injected.
@@ -651,9 +662,10 @@ impl Serialize for SignedOrder {
 
 /// Helper struct for serializing V2 Order with signature injected.
 ///
-/// Note: `expiration` is included as `"0"` in the POST body for compat but
-/// is NOT part of the EIP-712 digest. `metadata` and `builder` are `bytes32`
-/// and serialize as `0x`-prefixed 64-hex strings.
+/// `expiration` is a decimal string (seconds since epoch; `"0"` = GTC) carried
+/// from user input through `SignableOrderV2` into this POST body struct. It is
+/// NOT part of the EIP-712 digest. `metadata` and `builder` are `bytes32` and
+/// serialize as `0x`-prefixed 64-hex strings.
 #[serde_as]
 #[derive(Serialize)]
 struct OrderWithSignatureV2<'order> {
@@ -672,9 +684,8 @@ struct OrderWithSignatureV2<'order> {
     taker_amount: &'order U256,
     /// Side serialized as "BUY"/"SELL" string (CLOB API requirement)
     side: Side,
-    /// Always serialized as the string "0" for V2 POST-body compatibility.
-    /// Not part of the V2 EIP-712 digest.
-    expiration: &'static str,
+    /// Expiration as decimal string; "0" = GTC. Not part of the V2 EIP-712 digest.
+    expiration: String,
     #[serde(rename = "signatureType")]
     signature_type: u8,
     #[serde_as(as = "DisplayFromStr")]
@@ -703,7 +714,7 @@ impl Serialize for SignedOrderV2 {
                 maker_amount: &self.order.makerAmount,
                 taker_amount: &self.order.takerAmount,
                 side,
-                expiration: "0",
+                expiration: self.expiration.to_string(),
                 signature_type: self.order.signatureType,
                 timestamp: &self.order.timestamp,
                 metadata: &self.order.metadata,
