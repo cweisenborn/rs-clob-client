@@ -204,6 +204,10 @@ pub(crate) mod l1 {
         let signature = signer.sign_hash(&hash).await?;
 
         let mut map = HeaderMap::new();
+        // POLY_ADDRESS is emitted lowercase (alloy's encode_hex_with_prefix). py-clob-client-v2
+        // emits EIP-55 checksum casing. Probed against clob-v2.polymarket.com 2026-04-22:
+        // server canonicalizes before HMAC verification — both casings accepted. Keeping
+        // lowercase for stability with upstream alloy Address display.
         map.insert(
             POLY_ADDRESS,
             signer.address().encode_hex_with_prefix().parse()?,
@@ -244,6 +248,8 @@ pub(crate) mod l2 {
 
         let mut map = HeaderMap::new();
 
+        // See l1::create_headers for the POLY_ADDRESS casing rationale — server
+        // canonicalizes, both lowercase and EIP-55 checksum accepted (probed 2026-04-22).
         map.insert(
             POLY_ADDRESS,
             state.address.encode_hex_with_prefix().parse()?,
