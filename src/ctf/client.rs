@@ -236,6 +236,100 @@ impl<P: Provider + Clone> Client<P> {
         })
     }
 
+    /// Creates a CTF client that dispatches STANDARD (non-neg-risk) V2
+    /// split/merge/redeem through the V2 wrapper adapter at
+    /// `config.ctf_collateral_adapter` (pUSD-denominated — `0xADa1…9718` on Polygon).
+    ///
+    /// # Role — the missing V2 dispatch for non-neg-risk markets
+    ///
+    /// Polymarket's V2 rollout introduces **two** collateral-wrapper adapters
+    /// that replace V1's direct-to-CTF / direct-to-NegRiskAdapter calling
+    /// conventions:
+    ///
+    /// | V2 adapter field                       | Address (Polygon)                              | Routes for           |
+    /// |----------------------------------------|------------------------------------------------|----------------------|
+    /// | `config.ctf_collateral_adapter`        | `0xADa100874d00e3331D00F2007a9c336a65009718`   | STANDARD (negRisk=f) |
+    /// | `config.neg_risk_ctf_collateral_adapter` | `0xAdA200001000ef00D07553cEE7006808F895c6F1` | NEG-RISK (negRisk=t) |
+    ///
+    /// `with_neg_risk_v2` already covers the neg-risk path. This constructor
+    /// covers the parallel STANDARD path so callers can dispatch per-market on
+    /// Gamma's `negRisk` flag without falling back to the V1 CTF contract
+    /// (which will be deprecated 2026-04-28).
+    ///
+    /// # The pUSD → USDC.e wrapping trick
+    ///
+    /// The wrapper contract at `config.ctf_collateral_adapter` accepts pUSD as
+    /// its collateral input (so the EOA approves/holds pUSD, not USDC.e) and
+    /// internally converts pUSD → USDC.e before forwarding to the real CTF
+    /// contract at `config.conditional_tokens`. Critically, the wrapper exposes
+    /// **canonical `IConditionalTokens` 5-arg selectors** —
+    /// `splitPosition(address,bytes32,bytes32,uint256[],uint256)`,
+    /// `mergePositions(...)`, `redeemPositions(...)` — so from the calldata
+    /// perspective it is indistinguishable from the raw CTF contract.
+    ///
+    /// We therefore deliberately place the wrapper's address in the
+    /// `contract: IConditionalTokens::…Instance` field (typed as
+    /// `IConditionalTokens`, not a new wrapper type) and let the existing
+    /// `split_position` / `merge_positions` / `redeem_positions` methods route
+    /// through it unchanged. `neg_risk_adapter` is left `None` — this client
+    /// is non-neg-risk.
+    ///
+    /// This mirrors `with_neg_risk_v2`'s design where the V2 neg-risk wrapper
+    /// is typed as `INegRiskAdapter` because its selectors are compatible; the
+    /// only structural difference between the two V2 constructors is which
+    /// field holds the wrapper address (here: `contract`, there:
+    /// `neg_risk_adapter`) and which interface the wrapper conforms to (here:
+    /// 5-arg CTF, there: 2-arg NegRiskAdapter).
+    ///
+    /// Verified against a live unresolved standard BTC market via eth_call
+    /// (pre-cutover integration test):
+    ///
+    /// ```text
+    /// STD.splitPosition(pUSD, 0x0, cid, [1, 2], 1e6) from=EOA → 0x (success)
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - An alloy provider instance
+    /// * `chain_id` - The chain ID (137 for Polygon mainnet). Amoy (80002) has
+    ///   no V2 adapter configured and will return `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The contract configuration is not found for the given chain (e.g. an
+    ///   unknown chain ID).
+    /// - The chain has no V2 standard CTF collateral adapter configured
+    ///   (`config.ctf_collateral_adapter` is `None`) — e.g., Amoy
+    ///   pre-V2-deployment.
+    pub fn with_standard_v2(provider: P, chain_id: ChainId) -> Result<Self> {
+        let config = contract_config(chain_id, false).ok_or_else(|| {
+            CtfError::ContractCall(format!(
+                "CTF contract configuration not found for chain ID {chain_id}"
+            ))
+        })?;
+
+        let adapter_addr = config.ctf_collateral_adapter.ok_or_else(|| {
+            CtfError::ContractCall(format!(
+                "V2 standard CTF collateral adapter not configured for chain ID {chain_id}"
+            ))
+        })?;
+
+        // Intentionally type the wrapper as IConditionalTokens: it exposes
+        // canonical 5-arg CTF selectors (splitPosition / mergePositions /
+        // redeemPositions) and internally handles pUSD → USDC.e conversion
+        // before forwarding to the real CTF contract. This lets the existing
+        // split_position / merge_positions / redeem_positions methods on this
+        // client route through the wrapper unchanged.
+        let contract = IConditionalTokens::new(adapter_addr, provider.clone());
+
+        Ok(Self {
+            contract,
+            neg_risk_adapter: None,
+            provider,
+        })
+    }
+
     /// Calculates a condition ID.
     ///
     /// The condition ID is derived from the oracle address, question hash, and number of outcome slots.
