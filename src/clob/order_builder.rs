@@ -40,6 +40,7 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
     pub(crate) signer: Address,
     pub(crate) signature_type: SignatureType,
     pub(crate) salt_generator: fn() -> u64,
+    pub(crate) timestamp_ms_source: fn() -> i64,
     pub(crate) token_id: Option<U256>,
     pub(crate) price: Option<Decimal>,
     pub(crate) size: Option<Decimal>,
@@ -55,6 +56,13 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
     pub(crate) metadata: FixedBytes<32>,
     pub(crate) builder_field: FixedBytes<32>,
     pub(crate) _kind: PhantomData<OrderKind>,
+}
+
+/// Convert a millisecond-timestamp closure into a [`U256`] suitable for
+/// the `timestamp` field of an [`OrderV2`].  Extracted so it can be
+/// unit-tested independently of the async network stack.
+pub fn compute_timestamp(source: fn() -> i64) -> U256 {
+    U256::from(u64::try_from(source()).expect("system clock is post-1970"))
 }
 
 impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
@@ -335,8 +343,6 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             .minimum_tick_size
             .as_decimal();
 
-        let decimals = minimum_tick_size.scale();
-
         if price.scale() > minimum_tick_size.scale() {
             return Err(Error::validation(format!(
                 "Unable to build Order: Price {price} has {} decimal places. Minimum tick size \
@@ -372,59 +378,33 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         }
 
         let order_type = self.order_type.unwrap_or(OrderType::GTC);
-        let post_only = Some(self.post_only.unwrap_or(false));
+        let post_only = self.post_only.unwrap_or(false);
 
         // V2 does not use expiration in the signing digest; we skip the GTD/expiration
         // validation that V1 enforces since expiration is not relevant to V2 orders.
 
-        if post_only == Some(true) && !matches!(order_type, OrderType::GTC | OrderType::GTD) {
+        if post_only && !matches!(order_type, OrderType::GTC | OrderType::GTD) {
             return Err(Error::validation(
                 "postOnly is only supported for GTC and GTD orders",
             ));
         }
 
-        // Same maker/taker amount computation as V1 — only the struct shape changes.
-        let (taker_amount, maker_amount) = match side {
-            Side::Buy => (
-                size,
-                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
-            ),
-            Side::Sell => (
-                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
-                size,
-            ),
-            side => return Err(Error::validation(format!("Invalid side: {side}"))),
-        };
-
-        let salt = to_ieee_754_int((self.salt_generator)());
-
-        let timestamp = U256::from(
-            u64::try_from(Utc::now().timestamp())
-                .expect("system clock is post-1970"),
-        );
-
-        let order = OrderV2 {
-            salt: U256::from(salt),
-            maker: self.funder.unwrap_or(self.signer),
-            signer: self.signer,
-            tokenId: token_id,
-            makerAmount: U256::from(to_fixed_u128(maker_amount)),
-            takerAmount: U256::from(to_fixed_u128(taker_amount)),
-            side: side as u8,
-            signatureType: self.signature_type as u8,
-            timestamp,
-            metadata: self.metadata,
-            builder: self.builder_field,
-        };
-
-        #[cfg(feature = "tracing")]
-        tracing::debug!(token_id = %token_id, side = ?side, price = %price, size = %size, "V2 limit order built");
-
-        Ok(SignableOrderV2 {
-            order,
+        assemble_signable_order_v2(
+            token_id,
+            side,
+            price,
+            size,
+            minimum_tick_size,
             order_type,
             post_only,
-        })
+            self.salt_generator,
+            self.timestamp_ms_source,
+            self.funder,
+            self.signer,
+            self.signature_type,
+            self.metadata,
+            self.builder_field,
+        )
     }
 }
 
@@ -636,6 +616,78 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
             post_only: None,
         })
     }
+}
+
+/// Pure synchronous core of V2 order assembly.
+///
+/// All inputs are fully validated by the time this is called — `build_v2`
+/// handles validation and the single async I/O (tick_size fetch), then
+/// delegates here.  Exposed as `pub(crate)` so the test suite can call it
+/// with a mocked `tick_size` and a pinned `timestamp_ms_source` seam without
+/// requiring a live network client.
+///
+/// A revert of the `compute_timestamp(timestamp_ms_source)` call below back to
+/// `Utc::now().timestamp()` will cause `build_v2_assembles_ms_timestamp` in
+/// `tests/v2_timestamp_ms.rs` to fail: the pinned seam would be ignored and
+/// the returned timestamp would differ from `U256::from(1_800_000_000_000u64)`.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_signable_order_v2(
+    token_id: U256,
+    side: Side,
+    price: Decimal,
+    size: Decimal,
+    minimum_tick_size: Decimal,
+    order_type: OrderType,
+    post_only: bool,
+    salt_generator: fn() -> u64,
+    timestamp_ms_source: fn() -> i64,
+    funder: Option<Address>,
+    signer: Address,
+    signature_type: SignatureType,
+    metadata: FixedBytes<32>,
+    builder_field: FixedBytes<32>,
+) -> Result<SignableOrderV2> {
+    let decimals = minimum_tick_size.scale();
+
+    // Same maker/taker amount computation as V1 — only the struct shape changes.
+    let (taker_amount, maker_amount) = match side {
+        Side::Buy => (
+            size,
+            (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+        ),
+        Side::Sell => (
+            (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+            size,
+        ),
+        side => return Err(Error::validation(format!("Invalid side: {side}"))),
+    };
+
+    let salt = to_ieee_754_int(salt_generator());
+
+    let timestamp = compute_timestamp(timestamp_ms_source);
+
+    let order = OrderV2 {
+        salt: U256::from(salt),
+        maker: funder.unwrap_or(signer),
+        signer,
+        tokenId: token_id,
+        makerAmount: U256::from(to_fixed_u128(maker_amount)),
+        takerAmount: U256::from(to_fixed_u128(taker_amount)),
+        side: side as u8,
+        signatureType: signature_type as u8,
+        timestamp,
+        metadata,
+        builder: builder_field,
+    };
+
+    #[cfg(feature = "tracing")]
+    tracing::debug!(token_id = %token_id, side = ?side, price = %price, size = %size, "V2 limit order built");
+
+    Ok(SignableOrderV2 {
+        order,
+        order_type,
+        post_only: Some(post_only),
+    })
 }
 
 /// Removes trailing zeros, truncates to [`USDC_DECIMALS`] decimal places, and quanitizes as an

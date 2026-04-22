@@ -2205,6 +2205,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             signature_type: self.inner.signature_type,
             funder: self.inner.funder,
             salt_generator: self.inner.salt_generator,
+            timestamp_ms_source: || Utc::now().timestamp_millis(),
             token_id: None,
             price: None,
             size: None,
