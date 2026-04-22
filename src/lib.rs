@@ -181,30 +181,42 @@ pub fn wallet_contract_config(chain_id: ChainId) -> Option<&'static WalletContra
 #[cfg(feature = "clob")]
 impl ContractConfig {
     /// Addresses that must be granted USDC + CTF approvals for this
-    /// `OrderVersion`. Returns standard exchange + neg-risk exchange (if any)
-    /// for that version, plus the neg-risk adapter (shared across versions).
+    /// `OrderVersion`.
+    ///
+    /// V1: standard exchange + neg-risk exchange + OLD neg-risk adapter (USDC.e).
+    /// V2: V2 standard exchange + V2 neg-risk exchange + V2 CTF collateral adapter
+    ///     + V2 neg-risk CTF collateral adapter (all pUSD). OLD adapter is NOT
+    ///     in the V2 set — V2 operations never touch it.
     pub fn approval_spenders(&self, version: OrderVersion) -> Vec<Address> {
-        let mut out = Vec::with_capacity(3);
         match version {
             OrderVersion::V1 => {
+                let mut out = Vec::with_capacity(3);
                 out.push(self.exchange);
                 if let Some(nre) = self.neg_risk_exchange {
                     out.push(nre);
                 }
+                if let Some(adapter) = self.neg_risk_adapter {
+                    out.push(adapter);
+                }
+                out
             }
             OrderVersion::V2 => {
+                let mut out = Vec::with_capacity(4);
                 if let Some(ex) = self.exchange_v2 {
                     out.push(ex);
                 }
                 if let Some(nre) = self.neg_risk_exchange_v2 {
                     out.push(nre);
                 }
+                if let Some(adapter) = self.ctf_collateral_adapter {
+                    out.push(adapter);
+                }
+                if let Some(adapter) = self.neg_risk_ctf_collateral_adapter {
+                    out.push(adapter);
+                }
+                out
             }
         }
-        if let Some(adapter) = self.neg_risk_adapter {
-            out.push(adapter);
-        }
-        out
     }
 }
 
@@ -516,6 +528,37 @@ mod v2_contract_config_tests {
         assert!(cfg.ctf_collateral_adapter.is_none());
         assert!(cfg.neg_risk_ctf_collateral_adapter.is_none());
     }
+
+    #[test]
+    fn approval_spenders_v2_is_4_and_excludes_old_adapter() {
+        use crate::OrderVersion;
+        let cfg = contract_config(137, false).expect("chain 137 config");
+        let spenders = cfg.approval_spenders(OrderVersion::V2);
+
+        assert_eq!(spenders.len(), 4, "V2 spender set size");
+        assert!(spenders.contains(&cfg.exchange_v2.unwrap()), "V2 standard exchange");
+        assert!(spenders.contains(&cfg.neg_risk_exchange_v2.unwrap()), "V2 neg-risk exchange");
+        assert!(spenders.contains(&cfg.ctf_collateral_adapter.unwrap()), "V2 CTF collateral adapter (new wrapper)");
+        assert!(spenders.contains(&cfg.neg_risk_ctf_collateral_adapter.unwrap()), "V2 NegRisk CTF collateral adapter (new wrapper)");
+
+        // The OLD adapter MUST NOT be in the V2 set.
+        assert!(
+            !spenders.contains(&cfg.neg_risk_adapter.unwrap()),
+            "OLD adapter 0xd91E80cF must not be in V2 approval set"
+        );
+    }
+
+    #[test]
+    fn approval_spenders_v1_unchanged() {
+        use crate::OrderVersion;
+        let cfg = contract_config(137, false).expect("chain 137 config");
+        let spenders = cfg.approval_spenders(OrderVersion::V1);
+
+        assert_eq!(spenders.len(), 3, "V1 spender set size");
+        assert!(spenders.contains(&cfg.exchange), "V1 standard exchange");
+        assert!(spenders.contains(&cfg.neg_risk_exchange.unwrap()), "V1 neg-risk exchange");
+        assert!(spenders.contains(&cfg.neg_risk_adapter.unwrap()), "V1 OLD adapter");
+    }
 }
 
 #[cfg(test)]
@@ -558,14 +601,17 @@ mod contract_config_v2_tests {
     }
 
     #[test]
-    fn approval_spenders_v2_includes_v2_and_shared_adapter() {
+    fn approval_spenders_v2_includes_v2_and_new_adapters() {
         use super::OrderVersion;
         let cfg = contract_config(POLYGON, false).unwrap();
         let spenders = cfg.approval_spenders(OrderVersion::V2);
         assert!(spenders.contains(&cfg.exchange_v2.unwrap()));
         assert!(spenders.contains(&cfg.neg_risk_exchange_v2.unwrap()));
-        // Neg-risk adapter is shared across versions
-        assert!(spenders.contains(&cfg.neg_risk_adapter.unwrap()));
+        // V2 new pUSD wrapper adapters must be present
+        assert!(spenders.contains(&cfg.ctf_collateral_adapter.unwrap()));
+        assert!(spenders.contains(&cfg.neg_risk_ctf_collateral_adapter.unwrap()));
+        // OLD adapter MUST NOT be in the V2 set
+        assert!(!spenders.contains(&cfg.neg_risk_adapter.unwrap()));
         // V1-only addresses must NOT leak into V2 set
         assert!(!spenders.contains(&cfg.exchange));
     }
