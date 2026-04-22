@@ -478,7 +478,7 @@ See [`examples/clob/authenticated.rs`](examples/clob/authenticated.rs) for compr
 
 Runtime opt-in via `OrderVersion::V2` on the builder, or set as a client default:
 
-```rust
+```rust,ignore
 use polymarket_client_sdk::clob::types::OrderVersion;
 
 // Per-order opt-in
