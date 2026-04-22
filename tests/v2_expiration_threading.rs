@@ -61,6 +61,7 @@ fn v2_post_body_expiration_matches_fixture() {
         FixedBytes::<32>::ZERO,               // metadata
         FixedBytes::<32>::ZERO,               // builder
         U256::from(EXPIRATION_SECS),          // expiration (GTD: 1h past signing)
+        None,                                 // maker_amount_override: limit orders use default
     )
     .expect("assemble_signable_order_v2 must succeed");
 
@@ -117,6 +118,7 @@ fn v2_post_body_expiration_zero_for_gtc() {
         FixedBytes::<32>::ZERO,        // metadata
         FixedBytes::<32>::ZERO,        // builder
         U256::ZERO,                    // expiration = 0 (GTC)
+        None,                          // maker_amount_override: limit orders use default
     )
     .expect("assemble_signable_order_v2 must succeed");
 

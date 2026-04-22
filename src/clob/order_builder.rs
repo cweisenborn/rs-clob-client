@@ -419,6 +419,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             self.metadata,
             self.builder_field,
             expiration_secs,
+            None, // maker_amount_override: Limit orders always derive maker from price*size
         )
     }
 }
@@ -631,6 +632,149 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
             post_only: None,
         })
     }
+
+    /// Build into a V2 signable market order. Produces [`SignableOrderV2`] with:
+    ///   - No taker, nonce, or feeRateBps (V1-only fields)
+    ///   - ms timestamp via `timestamp_ms_source` seam (default: `Utc::now().timestamp_millis()`)
+    ///   - `metadata` and `builder` fields from builder state (default zero)
+    ///   - `expiration = 0` (market orders fill immediately or cancel)
+    ///   - `post_only = false` (market orders are never post-only)
+    ///   - `order_type` must be `FOK` or `FAK`; defaults to `FAK`
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), err(level = "warn"))
+    )]
+    pub async fn build_v2(self) -> Result<SignableOrderV2> {
+        let Some(token_id) = self.token_id else {
+            return Err(Error::validation(
+                "Unable to build Order due to missing token ID",
+            ));
+        };
+
+        let Some(side) = self.side else {
+            return Err(Error::validation(
+                "Unable to build Order due to missing token side",
+            ));
+        };
+
+        let amount = self
+            .amount
+            .ok_or_else(|| Error::validation("Unable to build Order due to missing amount"))?;
+
+        let order_type = self.order_type.clone().unwrap_or(OrderType::FAK);
+
+        if !matches!(order_type, OrderType::FOK | OrderType::FAK) {
+            return Err(Error::validation(
+                "V2 market orders must use FOK or FAK order type",
+            ));
+        }
+
+        if self.post_only == Some(true) {
+            return Err(Error::validation(
+                "postOnly is only supported for limit orders",
+            ));
+        }
+
+        let price = match self.price {
+            Some(price) => price,
+            None => self.calculate_price(order_type.clone()).await?,
+        };
+
+        let minimum_tick_size = self
+            .client
+            .tick_size(token_id)
+            .await?
+            .minimum_tick_size
+            .as_decimal();
+
+        let decimals = minimum_tick_size.scale();
+
+        // Ensure the market price is truncated to tick size precision.
+        let price = price.trunc_with_scale(decimals);
+        if price < minimum_tick_size || price > Decimal::ONE - minimum_tick_size {
+            return Err(Error::validation(format!(
+                "Price {price} is too small or too large for the minimum tick size {minimum_tick_size}"
+            )));
+        }
+
+        // Derive size (in shares) from the market amount, mirroring V1 Market::build.
+        //
+        // For BUY+USDC we also carry the raw USDC input forward as maker_amount_override
+        // so that assemble_signable_order_v2 uses the user's exact USDC value rather than
+        // recomputing it from size*price. That recomputation loses up to one tick for any
+        // price that does not evenly divide the USDC amount (e.g. 100 USDC / 0.33).
+        //
+        // py SDK reference (authoritative):
+        //   BUY+USDC:   maker_amount = round_down(usdc, lot)  ← user's exact input
+        //               taker_amount = maker_amount / price    ← shares derived from that
+        // BUY+Shares:   taker_amount = shares, maker_amount = shares*price
+        // SELL+Shares:  maker_amount = shares, taker_amount = shares*price
+        let raw_amount = amount.as_inner();
+        let (size, maker_amount_override) = match (side, amount.0) {
+            (Side::Buy, AmountInner::Usdc(_)) => {
+                let shares = (raw_amount / price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+                // Round the user's USDC input down to lot precision and scale to 6 decimals.
+                let raw_maker_usdc = raw_amount.trunc_with_scale(USDC_DECIMALS);
+                let raw_maker_u256 = U256::from(
+                    (raw_maker_usdc * Decimal::from(10u64.pow(USDC_DECIMALS)))
+                        .to_u128()
+                        .ok_or_else(|| Error::validation("maker_amount overflow"))?,
+                );
+                (shares, Some(raw_maker_u256))
+            }
+            (Side::Buy, AmountInner::Shares(_)) => (raw_amount, None),
+            (Side::Sell, AmountInner::Shares(_)) => (raw_amount, None),
+            (Side::Sell, AmountInner::Usdc(_)) => {
+                return Err(Error::validation(
+                    "Sell Orders must specify their `amount`s in shares",
+                ));
+            }
+            (side, _) => return Err(Error::validation(format!("Invalid side: {side}"))),
+        };
+
+        // Reject zero or negative size — a zero-size market order can never fill.
+        if size.is_zero() || size.is_sign_negative() {
+            return Err(Error::validation(format!(
+                "Unable to build market order due to zero/negative size {size}"
+            )));
+        }
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(token_id = %token_id, side = ?side, price = %price, amount = %raw_amount, "V2 market order built");
+
+        assemble_signable_order_v2(
+            token_id,
+            side,
+            price,
+            size,
+            minimum_tick_size,
+            order_type,
+            false, // post_only: market orders are never post-only
+            self.salt_generator,
+            self.timestamp_ms_source,
+            self.funder,
+            self.signer,
+            self.signature_type,
+            self.metadata,
+            self.builder_field,
+            U256::ZERO,           // expiration: market orders fill immediately or cancel
+            maker_amount_override, // BUY+USDC: user's exact USDC input; else None
+        )
+    }
+
+    /// Build into an [`AnySignableOrder`], dispatching on the builder's configured
+    /// `order_version`. V1 produces the existing [`SignableOrder`]; V2 produces
+    /// [`SignableOrderV2`] with the V2 field layout.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), err(level = "warn"))
+    )]
+    pub async fn build_any(self) -> Result<AnySignableOrder> {
+        match self.order_version {
+            OrderVersion::V1 => Ok(AnySignableOrder::V1(self.build().await?)),
+            OrderVersion::V2 => Ok(AnySignableOrder::V2(self.build_v2().await?)),
+        }
+    }
 }
 
 /// Pure synchronous core of V2 order assembly.
@@ -640,6 +784,13 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
 /// delegates here.  Exposed as `pub(crate)` so the test suite can call it
 /// with a mocked `tick_size` and a pinned `timestamp_ms_source` seam without
 /// requiring a live network client.
+///
+/// `maker_amount_override`: when `Some(v)`, that value is used as the
+/// `makerAmount` field of the V2 order rather than the default `size * price`
+/// computation. Pass `Some` only for BUY+USDC market orders, where the
+/// maker_amount must equal the user's exact USDC input (rounded down to lot
+/// precision) rather than being re-derived from `size * price` (which loses
+/// up to one tick for non-clean-divisor prices). All other callers pass `None`.
 ///
 /// A revert of the `compute_timestamp(timestamp_ms_source)` call below back to
 /// `Utc::now().timestamp()` will cause `build_v2_assembles_ms_timestamp` in
@@ -662,6 +813,7 @@ pub fn assemble_signable_order_v2(
     metadata: FixedBytes<32>,
     builder_field: FixedBytes<32>,
     expiration: U256,
+    maker_amount_override: Option<U256>,
 ) -> Result<SignableOrderV2> {
     // EIP-1271 smart-contract signing is not yet implemented. Reject early so
     // callers get a clear error rather than an order with an unusable signature.
@@ -675,15 +827,29 @@ pub fn assemble_signable_order_v2(
     let decimals = minimum_tick_size.scale();
 
     // Same maker/taker amount computation as V1 — only the struct shape changes.
-    let (taker_amount, maker_amount) = match side {
-        Side::Buy => (
-            size,
-            (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
-        ),
-        Side::Sell => (
-            (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
-            size,
-        ),
+    // When `maker_amount_override` is Some, it replaces the computed maker_amount.
+    // This is used by V2 Market BUY+USDC orders to pass the user's exact USDC
+    // input as maker_amount, rather than deriving it back from size*price (which
+    // reintroduces a one-tick loss for non-clean-divisor prices).
+    let (taker_amount_u256, maker_amount_u256) = match side {
+        Side::Buy => {
+            let taker_u256 = U256::from(to_fixed_u128(size));
+            let maker_u256 = maker_amount_override.unwrap_or_else(|| {
+                U256::from(to_fixed_u128(
+                    (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+                ))
+            });
+            (taker_u256, maker_u256)
+        }
+        Side::Sell => {
+            // maker = shares (size) — never overridden.
+            // taker = USDC received = size * price.
+            let maker_u256 = U256::from(to_fixed_u128(size));
+            let taker_u256 = U256::from(to_fixed_u128(
+                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+            ));
+            (taker_u256, maker_u256)
+        }
         side => return Err(Error::validation(format!("Invalid side: {side}"))),
     };
 
@@ -696,8 +862,8 @@ pub fn assemble_signable_order_v2(
         maker: funder.unwrap_or(signer),
         signer,
         tokenId: token_id,
-        makerAmount: U256::from(to_fixed_u128(maker_amount)),
-        takerAmount: U256::from(to_fixed_u128(taker_amount)),
+        makerAmount: maker_amount_u256,
+        takerAmount: taker_amount_u256,
         side: side as u8,
         signatureType: signature_type as u8,
         timestamp,

@@ -1,0 +1,23 @@
+{
+  "amount_usdc": 100.0,
+  "pinned_ms_timestamp": 1800000000000,
+  "price": 0.33,
+  "signed_order": {
+    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "expiration": "0",
+    "maker": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    "makerAmount": "100000000",
+    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "salt": "1234567890",
+    "side": 0,
+    "signature": "0xafd6075fc7b112f4f5b314b49ea9dc936438736dfb77c7e5a2c4be6411a64f4d6eb7bc87f8792618f6c40c2dfe1c8aae37da0ed1d6b8809f50c862f57a954de31b",
+    "signatureType": 0,
+    "signer": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    "takerAmount": "303030300",
+    "timestamp": "1800000000000",
+    "tokenId": "12345678901234567890"
+  },
+  "signer_eoa": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+  "tick_size": "0.01",
+  "token_id": "12345678901234567890"
+}

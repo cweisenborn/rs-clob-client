@@ -111,6 +111,7 @@ fn build_v2_assembles_ms_timestamp() {
         FixedBytes::<32>::ZERO,    // metadata
         FixedBytes::<32>::ZERO,    // builder
         U256::ZERO,                // expiration (GTC — not relevant for this test)
+        None,                      // maker_amount_override: limit orders use default computation
     );
 
     let signable = result.expect("assemble_signable_order_v2 must succeed with valid inputs");

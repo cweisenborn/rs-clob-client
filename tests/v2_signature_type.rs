@@ -83,6 +83,7 @@ fn poly_1271_signing_returns_not_implemented() {
         FixedBytes::<32>::ZERO,  // metadata
         FixedBytes::<32>::ZERO,  // builder
         U256::ZERO,              // expiration (GTC — not relevant for this test)
+        None,                    // maker_amount_override: limit orders use default computation
     );
 
     let err = result.expect_err("Poly1271 must return Err, not a signable order");
