@@ -647,6 +647,15 @@ pub fn assemble_signable_order_v2(
     metadata: FixedBytes<32>,
     builder_field: FixedBytes<32>,
 ) -> Result<SignableOrderV2> {
+    // EIP-1271 smart-contract signing is not yet implemented. Reject early so
+    // callers get a clear error rather than an order with an unusable signature.
+    if matches!(signature_type, SignatureType::Poly1271) {
+        return Err(Error::validation(
+            "EIP-1271 smart-contract signing not implemented (SignatureType::Poly1271); \
+             full implementation deferred to a follow-up spec",
+        ));
+    }
+
     let decimals = minimum_tick_size.scale();
 
     // Same maker/taker amount computation as V1 — only the struct shape changes.

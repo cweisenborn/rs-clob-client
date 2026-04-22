@@ -6,7 +6,7 @@ use bon::Builder;
 use rust_decimal_macros::dec;
 use serde::ser::{Error as _, SerializeStruct as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use serde_repr::Serialize_repr;
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::{DisplayFromStr, serde_as};
 use strum_macros::Display;
 
@@ -243,7 +243,7 @@ impl Amount {
     PartialEq,
     PartialOrd,
     Serialize_repr,
-    Deserialize,
+    Deserialize_repr,
 )]
 #[repr(u8)]
 pub enum SignatureType {
@@ -251,6 +251,12 @@ pub enum SignatureType {
     Eoa = 0,
     Proxy = 1,
     GnosisSafe = 2,
+    /// EIP-1271 `isValidSignature` flow for smart-contract wallets.
+    ///
+    /// Present for API parity with py-clob-client-v2 `SignatureTypeV2.POLY_1271`.
+    /// The actual signing path returns an error; a full implementation is tracked
+    /// as a follow-up spec.
+    Poly1271 = 3,
 }
 
 /// RFQ state filter for queries.
