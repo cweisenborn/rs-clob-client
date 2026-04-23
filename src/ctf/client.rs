@@ -541,6 +541,14 @@ impl<P: Provider + Clone> Client<P> {
             .await
             .map_err(|e| CtfError::ContractCall(format!("Failed to get split receipt: {e}")))?;
 
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "split tx reverted on-chain: tx={transaction_hash:#x} block={}",
+                receipt.block_number.unwrap_or_default()
+            ))
+            .into());
+        }
+
         Ok(SplitPositionResponse {
             transaction_hash,
             block_number: receipt.block_number.ok_or_else(|| {
@@ -593,6 +601,14 @@ impl<P: Provider + Clone> Client<P> {
             .await
             .map_err(|e| CtfError::ContractCall(format!("Failed to get merge receipt: {e}")))?;
 
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "merge tx reverted on-chain: tx={transaction_hash:#x} block={}",
+                receipt.block_number.unwrap_or_default()
+            ))
+            .into());
+        }
+
         Ok(MergePositionsResponse {
             transaction_hash,
             block_number: receipt.block_number.ok_or_else(|| {
@@ -643,6 +659,14 @@ impl<P: Provider + Clone> Client<P> {
             .get_receipt()
             .await
             .map_err(|e| CtfError::ContractCall(format!("Failed to get redeem receipt: {e}")))?;
+
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "redeem tx reverted on-chain: tx={transaction_hash:#x} block={}",
+                receipt.block_number.unwrap_or_default()
+            ))
+            .into());
+        }
 
         Ok(RedeemPositionsResponse {
             transaction_hash,
@@ -708,6 +732,14 @@ impl<P: Provider + Clone> Client<P> {
             CtfError::ContractCall(format!("Failed to get NegRisk split receipt: {e}"))
         })?;
 
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "NegRisk split tx reverted on-chain: tx={transaction_hash:#x} block={}",
+                receipt.block_number.unwrap_or_default()
+            ))
+            .into());
+        }
+
         Ok(SplitPositionResponse {
             transaction_hash,
             block_number: receipt.block_number.ok_or_else(|| {
@@ -762,6 +794,14 @@ impl<P: Provider + Clone> Client<P> {
         let receipt = pending_tx.get_receipt().await.map_err(|e| {
             CtfError::ContractCall(format!("Failed to get NegRisk merge receipt: {e}"))
         })?;
+
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "NegRisk merge tx reverted on-chain: tx={transaction_hash:#x} block={}",
+                receipt.block_number.unwrap_or_default()
+            ))
+            .into());
+        }
 
         Ok(MergePositionsResponse {
             transaction_hash,
@@ -825,6 +865,14 @@ impl<P: Provider + Clone> Client<P> {
         let receipt = pending_tx.get_receipt().await.map_err(|e| {
             CtfError::ContractCall(format!("Failed to get NegRisk redeem receipt: {e}"))
         })?;
+
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "NegRisk redeem tx reverted on-chain: tx={transaction_hash:#x} block={}",
+                receipt.block_number.unwrap_or_default()
+            ))
+            .into());
+        }
 
         Ok(RedeemNegRiskResponse {
             transaction_hash,
