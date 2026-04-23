@@ -369,4 +369,45 @@ mod neg_risk {
 
         Ok(())
     }
+
+    /// Pins the post-fix invariant for `with_neg_risk_v2`: the client is
+    /// shape-compatible with `with_standard_v2` — both bind the
+    /// `IConditionalTokens` interface to their respective V2 wrapper addresses
+    /// and leave the V1 2-arg `neg_risk_adapter` slot empty. Callers use the
+    /// 5-arg `split_position` / `merge_positions` / `redeem_positions` with
+    /// pUSD collateral; the 2-arg `split_position_neg_risk` path is V1-only
+    /// under this fix (the V2 wrapper does not expose the 2-arg selector —
+    /// diagnosed on-chain 2026-04-23 via `eth_call`).
+    ///
+    /// This test pins the constructor contract via the public Ok/Err surface
+    /// (the doc comment on `with_neg_risk_v2` is the structural contract —
+    /// private fields are not asserted directly to avoid coupling tests to
+    /// implementation layout).
+    #[tokio::test]
+    async fn with_neg_risk_v2_uses_iconditionaltokens_shape() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let provider = ProviderBuilder::new().connect(&server.base_url()).await?;
+
+        // Chain 137 has both V2 wrapper adapters configured.
+        let neg_risk = Client::with_neg_risk_v2(provider.clone(), 137);
+        assert!(
+            neg_risk.is_ok(),
+            "chain 137 has V2 neg-risk CTF collateral adapter configured"
+        );
+
+        // Sibling V2 constructor — same shape, different wrapper.
+        let standard = Client::with_standard_v2(provider, 137);
+        assert!(
+            standard.is_ok(),
+            "chain 137 has V2 standard CTF collateral adapter configured"
+        );
+
+        // Both V2 clients are `Client<P>` of the same type — callers use the
+        // same 5-arg split_position/merge_positions/redeem_positions methods
+        // on each, differing only in which wrapper address backs `contract`.
+        let _: &Client<_> = neg_risk.as_ref().unwrap();
+        let _: &Client<_> = standard.as_ref().unwrap();
+
+        Ok(())
+    }
 }

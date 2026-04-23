@@ -201,18 +201,84 @@ impl<P: Provider + Clone> Client<P> {
         })
     }
 
-    /// Creates a CTF client that dispatches neg-risk split/merge/redeem through
-    /// the V2 wrapper adapter (`config.neg_risk_ctf_collateral_adapter`) —
-    /// pUSD-denominated.
+    /// Creates a CTF client that dispatches NEG-RISK V2 split/merge/redeem
+    /// through the V2 wrapper adapter at `config.neg_risk_ctf_collateral_adapter`
+    /// (pUSD-denominated — `0xAdA200001000ef00D07553cEE7006808F895c6F1` on
+    /// Polygon).
     ///
-    /// Use this for V2 neg-risk markets post-cutover. V1 neg-risk markets should
-    /// continue using `with_neg_risk` (which targets the OLD adapter at
-    /// `config.neg_risk_adapter`, USDC.e-denominated).
+    /// # Role — the neg-risk V2 dispatch
+    ///
+    /// Polymarket's V2 rollout introduces **two** collateral-wrapper adapters
+    /// that replace V1's direct-to-CTF / direct-to-`NegRiskAdapter` calling
+    /// conventions:
+    ///
+    /// | V2 adapter field                         | Address (Polygon)                            | Routes for           |
+    /// |------------------------------------------|----------------------------------------------|----------------------|
+    /// | `config.ctf_collateral_adapter`          | `0xADa100874d00e3331D00F2007a9c336a65009718` | STANDARD (negRisk=f) |
+    /// | `config.neg_risk_ctf_collateral_adapter` | `0xAdA200001000ef00D07553cEE7006808F895c6F1` | NEG-RISK (negRisk=t) |
+    ///
+    /// `with_standard_v2` covers the STANDARD path; this constructor covers the
+    /// parallel NEG-RISK path so callers can dispatch per-market on Gamma's
+    /// `negRisk` flag without falling back to V1 (which will be deprecated
+    /// 2026-04-28).
+    ///
+    /// # The wrapper exposes 5-arg `IConditionalTokens` selectors (via inheritance)
+    ///
+    /// The `NegRiskCtfCollateralAdapter` contract at
+    /// `config.neg_risk_ctf_collateral_adapter` **inherits from
+    /// `CtfCollateralAdapter`** (see
+    /// [Polymarket/ctf-exchange-v2 `src/adapters/NegRiskCtfCollateralAdapter.sol`](https://github.com/Polymarket/ctf-exchange-v2/blob/main/src/adapters/NegRiskCtfCollateralAdapter.sol)).
+    /// Its public external surface is therefore the canonical
+    /// `IConditionalTokens` 5-arg shape:
+    ///
+    /// - `splitPosition(address, bytes32, bytes32, uint256[], uint256)`
+    /// - `mergePositions(address, bytes32, bytes32, uint256[], uint256)`
+    /// - `redeemPositions(address, bytes32, bytes32, uint256[])`
+    ///
+    /// It accepts pUSD as its collateral input (so the EOA approves/holds pUSD,
+    /// not USDC.e) and internally converts pUSD → USDC.e before forwarding to
+    /// the real CTF contract at `config.conditional_tokens`. From the calldata
+    /// perspective the wrapper is indistinguishable from the raw CTF contract —
+    /// just at a different address.
+    ///
+    /// Critically, the wrapper **does NOT expose** the 2-arg simplified
+    /// `splitPosition(bytes32, uint256)` / `mergePositions(bytes32, uint256)`
+    /// that the OLD V1 `NegRiskAdapter` (at `0xd91E80cF…`) exposes. That
+    /// interface is V1-only. Attempting to call the 2-arg selectors against
+    /// the V2 wrapper reverts with `data: "0x"` (unknown selector) — diagnosed
+    /// on-chain 2026-04-23 via `eth_call` prior to this fix.
+    ///
+    /// # Construction — symmetric with `with_standard_v2`
+    ///
+    /// We therefore bind the `IConditionalTokens` interface directly to the
+    /// wrapper address (not to `config.conditional_tokens`) and leave
+    /// `neg_risk_adapter` as `None`. Callers use the **same 5-arg methods** as
+    /// `with_standard_v2` — `split_position(&request)`,
+    /// `merge_positions(&request)`, `redeem_positions(&request)` — with pUSD as
+    /// the `collateral_token` field. The only structural difference between
+    /// the two V2 constructors is which wrapper address backs the `contract`
+    /// field.
+    ///
+    /// The legacy 2-arg methods on this client
+    /// (`split_position_neg_risk` / `merge_positions_neg_risk` / `redeem_neg_risk`)
+    /// will return `Err` because `neg_risk_adapter` is `None`; they are
+    /// intentionally V1-only post this fix. See their rustdoc for migration
+    /// guidance.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - An alloy provider instance
+    /// * `chain_id` - The chain ID (137 for Polygon mainnet). Amoy (80002) has
+    ///   no V2 adapter configured and will return `Err`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the chain has no V2 neg-risk adapter configured
-    /// (e.g., Amoy pre-V2-deployment).
+    /// Returns an error if:
+    /// - The contract configuration is not found for the given chain (e.g. an
+    ///   unknown chain ID).
+    /// - The chain has no V2 neg-risk CTF collateral adapter configured
+    ///   (`config.neg_risk_ctf_collateral_adapter` is `None`) — e.g., Amoy
+    ///   pre-V2-deployment.
     pub fn with_neg_risk_v2(provider: P, chain_id: ChainId) -> Result<Self> {
         let config = contract_config(chain_id, true).ok_or_else(|| {
             CtfError::ContractCall(format!(
@@ -226,12 +292,24 @@ impl<P: Provider + Clone> Client<P> {
             ))
         })?;
 
-        let contract = IConditionalTokens::new(config.conditional_tokens, provider.clone());
-        let neg_risk_adapter = Some(INegRiskAdapter::new(adapter_addr, provider.clone()));
+        // Wrapper exposes the IConditionalTokens-compatible 5-arg selectors via
+        // inheritance from CtfCollateralAdapter (see Polymarket/ctf-exchange-v2
+        // src/adapters/NegRiskCtfCollateralAdapter.sol). Bind the IConditionalTokens
+        // interface to the wrapper address — symmetric with `with_standard_v2`.
+        // Callers use the 5-arg `split_position(&request)` / `merge_positions(&request)` /
+        // `redeem_positions(&request)` methods with pUSD as collateral.
+        let contract = IConditionalTokens::new(adapter_addr, provider.clone());
 
         Ok(Self {
             contract,
-            neg_risk_adapter,
+            // The V2 neg-risk wrapper does NOT expose the 2-arg simplified
+            // interface (splitPosition(bytes32, uint256) etc.) — that is V1-only,
+            // implemented by the OLD NegRiskAdapter at 0xd91E80cF…. Calling
+            // the 2-arg selectors against this wrapper reverts with
+            // `data: "0x"` (unknown selector). Leaving this `None` forces
+            // the legacy 2-arg methods (split_position_neg_risk, etc.) to
+            // return Err — callers must migrate to the 5-arg path above.
+            neg_risk_adapter: None,
             provider,
         })
     }
@@ -574,16 +652,28 @@ impl<P: Provider + Clone> Client<P> {
         })
     }
 
-    /// Splits via the configured NegRisk adapter's 2-arg simplified signature.
+    /// Splits via the 2-arg simplified signature exposed by the OLD V1
+    /// `NegRiskAdapter`.
     ///
-    /// The adapter handles collateral + partition internally. For V1, this targets
-    /// the OLD adapter (USDC.e) when constructed via `with_neg_risk`. For V2, it
-    /// targets the NEW wrapper (pUSD) when constructed via `with_neg_risk_v2`.
+    /// **V1-only.** Intended for V1 neg-risk (OLD adapter via `with_neg_risk`,
+    /// USDC.e-denominated at `0xd91E80cF…`), which exposes the 2-arg
+    /// simplified interface `splitPosition(bytes32, uint256)` — the adapter
+    /// handles collateral + partition internally.
+    ///
+    /// Under **V2**, `with_neg_risk_v2` binds to a wrapper that does NOT
+    /// expose this 2-arg interface (its external surface is the canonical
+    /// 5-arg `IConditionalTokens` shape via inheritance from
+    /// `CtfCollateralAdapter`). V2 callers must use the 5-arg
+    /// `split_position(&request)` / `merge_positions(&request)` /
+    /// `redeem_positions(&request)` methods with pUSD as collateral instead.
+    /// This method will return `Err` on a `with_neg_risk_v2`-constructed
+    /// client because `neg_risk_adapter` is `None` under that path.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - This client was constructed without a NegRisk adapter (i.e., plain `Client::new`)
+    /// - This client was constructed without a V1 NegRisk adapter (i.e., plain
+    ///   `Client::new`, or `with_neg_risk_v2` — V2 does not expose this selector)
     /// - The transaction fails to send
     /// - The transaction fails to be mined
     #[cfg_attr(
@@ -600,7 +690,7 @@ impl<P: Provider + Clone> Client<P> {
     ) -> Result<SplitPositionResponse> {
         let adapter = self.neg_risk_adapter.as_ref().ok_or_else(|| {
             CtfError::ContractCall(
-                "NegRisk adapter not configured — use with_neg_risk or with_neg_risk_v2".to_owned(),
+                "NegRisk adapter not configured — V1-only path, use Client::with_neg_risk. Under V2 (with_neg_risk_v2), use the 5-arg split_position / merge_positions instead (wrapper exposes IConditionalTokens)".to_owned(),
             )
         })?;
 
@@ -626,14 +716,19 @@ impl<P: Provider + Clone> Client<P> {
         })
     }
 
-    /// Merges via the configured NegRisk adapter's 2-arg simplified signature.
+    /// Merges via the 2-arg simplified signature exposed by the OLD V1
+    /// `NegRiskAdapter`.
     ///
-    /// See `split_position_neg_risk` for dispatch semantics (V1 vs V2 adapter).
+    /// **V1-only.** See `split_position_neg_risk` for full dispatch
+    /// semantics. Under V2, `with_neg_risk_v2` binds to a wrapper that does
+    /// NOT expose this 2-arg interface — callers must use the 5-arg
+    /// `merge_positions(&request)` with pUSD collateral instead.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - This client was constructed without a NegRisk adapter (i.e., plain `Client::new`)
+    /// - This client was constructed without a V1 NegRisk adapter (i.e., plain
+    ///   `Client::new`, or `with_neg_risk_v2` — V2 does not expose this selector)
     /// - The transaction fails to send
     /// - The transaction fails to be mined
     #[cfg_attr(
@@ -650,7 +745,7 @@ impl<P: Provider + Clone> Client<P> {
     ) -> Result<MergePositionsResponse> {
         let adapter = self.neg_risk_adapter.as_ref().ok_or_else(|| {
             CtfError::ContractCall(
-                "NegRisk adapter not configured — use with_neg_risk or with_neg_risk_v2".to_owned(),
+                "NegRisk adapter not configured — V1-only path, use Client::with_neg_risk. Under V2 (with_neg_risk_v2), use the 5-arg split_position / merge_positions instead (wrapper exposes IConditionalTokens)".to_owned(),
             )
         })?;
 
@@ -676,16 +771,26 @@ impl<P: Provider + Clone> Client<P> {
         })
     }
 
-    /// Redeems positions from negative risk markets.
+    /// Redeems positions from V1 negative risk markets via the OLD V1
+    /// `NegRiskAdapter`'s amount-keyed `redeemPositions` signature.
     ///
-    /// This method uses the `NegRisk` adapter to redeem positions by specifying
-    /// the exact amounts of each outcome token to redeem. This is different from
-    /// the standard `redeem_positions` which uses index sets.
+    /// **V1-only.** Intended for V1 neg-risk (OLD adapter via `with_neg_risk`),
+    /// which exposes `redeemPositions(bytes32 conditionId, uint256[] amounts)`
+    /// — keyed by exact per-outcome amounts rather than index sets.
+    ///
+    /// Under **V2**, `with_neg_risk_v2` binds to a wrapper that does NOT
+    /// expose this signature (its surface is the canonical 5-arg
+    /// `IConditionalTokens` `redeemPositions(address, bytes32, bytes32, uint256[])`
+    /// via inheritance from `CtfCollateralAdapter`). V2 callers must use the
+    /// 5-arg `redeem_positions(&request)` with pUSD collateral and index sets
+    /// instead. This method returns `Err` on a `with_neg_risk_v2`-constructed
+    /// client because `neg_risk_adapter` is `None` under that path.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The client was not created with `with_neg_risk()` (adapter not available)
+    /// - The client was not created with `with_neg_risk()` (adapter not
+    ///   available — includes `Client::new` and `with_neg_risk_v2`)
     /// - The transaction fails to send
     /// - The transaction fails to be mined
     /// - The condition hasn't been resolved
@@ -703,7 +808,7 @@ impl<P: Provider + Clone> Client<P> {
     ) -> Result<RedeemNegRiskResponse> {
         let adapter = self.neg_risk_adapter.as_ref().ok_or_else(|| {
             CtfError::ContractCall(
-                "NegRisk adapter not available. Use Client::with_neg_risk() to enable NegRisk support".to_owned()
+                "NegRisk adapter not available — V1-only path, use Client::with_neg_risk() to enable. Under V2 (with_neg_risk_v2), use the 5-arg redeem_positions with pUSD + index sets instead (wrapper exposes IConditionalTokens)".to_owned()
             )
         })?;
 
