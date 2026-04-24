@@ -1552,7 +1552,24 @@ impl<K: Kind> Client<Authenticated<K>> {
                     ..Eip712Domain::default()
                 };
 
-                let signature = signer.sign_hash(&order.eip712_signing_hash(&domain)).await?;
+                let digest = order.eip712_signing_hash(&domain);
+                tracing::info!(
+                    target: "clob_order_diag",
+                    neg_risk,
+                    chain_id,
+                    verifying_contract = %format!("{:#x}", exchange_v2),
+                    token_id = %token_id,
+                    maker = %format!("{:#x}", order.maker),
+                    signer = %format!("{:#x}", order.signer),
+                    maker_amount = %order.makerAmount,
+                    taker_amount = %order.takerAmount,
+                    side = order.side,
+                    signature_type = order.signatureType,
+                    digest = %format!("{:#x}", digest),
+                    "DIAG V2 order signing: EIP-712 digest computed"
+                );
+
+                let signature = signer.sign_hash(&digest).await?;
 
                 let builder = SignedOrderV2::builder()
                     .order(order)
@@ -1576,6 +1593,17 @@ impl<K: Kind> Client<Authenticated<K>> {
     ///
     /// Returns an error if the order signature is invalid or the request fails.
     pub async fn post_any_order(&self, signed: AnySignedOrder) -> Result<PostOrderResponse> {
+        // DIAG: serialize the exact body we're about to POST so the operator
+        // can diff successful vs failing orders byte-for-byte.
+        if let Ok(body_json) = serde_json::to_string(&signed) {
+            tracing::info!(
+                target: "clob_order_diag",
+                url = %format!("{}order", self.host()),
+                body = %body_json,
+                "DIAG POST /order body"
+            );
+        }
+
         let request = self
             .client()
             .request(Method::POST, format!("{}order", self.host()))
